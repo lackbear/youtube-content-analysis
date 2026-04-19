@@ -77,7 +77,8 @@ ls data/raw/video_stats/date=*/channel_id=*/
 
 ## Deep dive
 
-Full design rationale, chapter-by-chapter narrative, and target architecture live in [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md).
+- [**docs/COLLECTORV2.md**](docs/COLLECTORV2.md) — user guide for the collector: setup, all attributes, CLI recipes, output layout
+- [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md) — full design rationale, chapter-by-chapter narrative, target architecture
 
 ---
 
