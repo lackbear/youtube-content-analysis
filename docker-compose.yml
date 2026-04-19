@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Chapter 3 local stack
+#
+# Today: one service, `collector`. Runs Collectorv2.py inside a container
+# with your data and logs bind-mounted so results land on the host.
+#
+# Chapter 4 will add `postgres` and `airflow` services *to this same file*.
+# Keeping the compose file extensible from day one is the point.
+#
+# Note: the top-level `version:` key is intentionally absent. Docker
+# Compose v2 (what you have with Docker Desktop) ignores it and warns you
+# when it's present. The modern convention is to omit it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  collector:
+    # Build the image from the Dockerfile next to this compose file.
+    # `args` lets us pass build-time variables (UID/GID) so the container's
+    # non-root user matches the host user. Critical on Linux/WSL2 to avoid
+    # "permission denied" when the container writes to bind-mounted folders.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+
+    # Tag the built image with a predictable name. Without this, Docker
+    # auto-generates names like `youtube-collector-collector` which are
+    # ugly to type and non-obvious in `docker images`.
+    image: youtube-collector:0.3.0
+
+    # Friendly container name. Without this, Docker appends a random suffix
+    # like `-1` every restart.
+    container_name: yt-collector
+
+    # Inject secrets at runtime, NOT at build time. Anything in .env
+    # becomes an environment variable inside the container. The collector
+    # reads YOUTUBE_API_KEY via os.getenv(), so this is all it needs.
+    env_file:
+      - .env
+
+    # Bind mounts: host path : container path : mode
+    #
+    # Strategy (the "hybrid" pattern):
+    #   - Code-ish files (config.yaml, competitors.csv) are read-only (:ro).
+    #     The container never writes to them; making them read-only catches
+    #     accidental writes loudly at the kernel level.
+    #   - Data-ish folders (./data, ./logs) are read-write so the collector
+    #     can land parquet files and quota logs on your host filesystem.
+    #
+    # The `./` paths are relative to this compose file. On WSL2 this Just
+    # Works; on native Windows you'd use volume mounts instead because
+    # bind mounts are slow through the Hyper-V layer.
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+      - ./competitors.csv:/app/competitors.csv:ro
+
+    # Restart policy: `no` for a batch job. A daily collector that dies
+    # should stay dead and surface to the operator (you, today; Airflow,
+    # next chapter). Do NOT use `always` or `unless-stopped` for batch
+    # jobs — you'll get infinite retry loops if the API key is wrong.
+    restart: "no"
+
+    # Memory/CPU guardrails. Optional, but healthy to set on laptops so a
+    # runaway pandas operation doesn't lock up your machine. These are
+    # generous defaults for the current workload (~12 channels × 10 videos).
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+    # Named network. Chapter 4 will put Airflow and Postgres on the same
+    # network so they can reach each other by service name.
+    networks:
+      - pipeline
+
+
+# ── Networks ────────────────────────────────────────────────────────────────
+# Declaring a user network explicitly (vs the default "bridge") gives us
+# DNS-based service discovery: `postgres` resolves to the postgres container
+# from any other container on this network. Prep for Chapter 4.
+networks:
+  pipeline:
+    driver: bridge
+
+
+# ── Volumes (named) ─────────────────────────────────────────────────────────
+# Empty for now. Chapter 4 adds `postgres_data:` here for Airflow metadata
+# persistence. Documented here as a placeholder so the structure is obvious.
+volumes: {}

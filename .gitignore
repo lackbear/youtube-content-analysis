@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitignore — what git MUST NOT track.
+#
+# Rule of thumb: secrets, state, and machine-specific build outputs are
+# gitignored. Source code, config templates, and docs are committed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Secrets (the single most important section) ──────────────────────────────
+# .env holds your YOUTUBE_API_KEY. Committing it would publish your key to
+# GitHub and any scraper watching public repos would exhaust your quota
+# within hours. .env.example IS committed — it's just a template with
+# placeholder values.
+.env
+.env.*
+!.env.example
+
+# Anything that looks like a credential file.
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Pipeline state (machine-specific, big, regenerable) ──────────────────────
+# Bronze outputs and logs are reproducible from the API — no reason to
+# version them. If you want reproducibility, snapshot to object storage
+# or DVC, not git.
+data/
+logs/
+video_stats.csv
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# Compose overrides (for personal local tweaks) should stay local.
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ── IDE / editor / OS ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints

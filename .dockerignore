@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore — what does NOT enter the build context.
+#
+# Why this matters:
+#   * Anything in the build context is sent to the Docker daemon on every
+#     build. Large folders (venv/, data/) make builds slow and waste disk.
+#   * Anything in the build context *can* end up in the image if a COPY
+#     ever widens. Keeping secrets and data OUT is defence in depth.
+#   * `.env` in an image is how API keys leak to public registries. Rule:
+#     never COPY .env. Inject secrets at runtime via --env-file or
+#     docker-compose env_file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Python virtualenv & bytecode ─────────────────────────────────────────────
+# We rebuild deps inside the image. The host venv has wrong arch/glibc anyway.
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# .env must NEVER be baked into the image. It's mounted or env-file'd at run.
+.env
+.env.*
+!.env.example
+
+# ── Runtime state ────────────────────────────────────────────────────────────
+# These are BIND-MOUNTED at runtime so the container writes to the host.
+# Copying them into the image would baffle debugging ("why is old data here?")
+# and balloon the image size.
+data/
+logs/
+
+# ── Legacy / chapter-1 artefacts ─────────────────────────────────────────────
+# Collector.py is kept in the repo for narrative, but the container only
+# needs Collectorv2.py. Same for the flat CSV from chapter 1.
+Collector.py
+video_stats.csv
+API_test.py
+get_channel_id.py
+
+# ── Docs / dev files ─────────────────────────────────────────────────────────
+docs/
+*.md
+!README.md
+Makefile
+
+# ── Git / editor metadata ────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.github/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Docker itself ────────────────────────────────────────────────────────────
+# Don't COPY these into the image — recursive weirdness.
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

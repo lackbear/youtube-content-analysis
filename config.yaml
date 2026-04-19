@@ -1,0 +1,56 @@
+# ── YouTube Collector Configuration ──────────────────────────────────────────
+
+# API
+api:
+  key_env_var: YOUTUBE_API_KEY      # env variable name holding your API key
+  max_retries: 3                    # retry attempts per failed call
+  batch_size: 50                    # max video IDs per videos.list call
+
+# Collection behaviour
+collection:
+  max_videos_per_channel: 10        # latest videos to pull per channel
+  refresh_days: 7                   # re-fetch videos younger than this (days)
+
+# Output
+output:
+  video_stats_file: video_stats   # filename without extension (extension added by format)
+  format: parquet                  # parquet (default) or csv
+
+# Attributes to fetch (comment out any you don't want)
+# None here = fetch all. Remove items to narrow scope + save quota.
+attributes:
+  - views
+  - likes
+  - comments
+  - duration
+  - tags
+  - description
+  - thumbnail_url
+  - category_id
+
+# Competitor channels (handles or IDs — mixed is fine)
+channels:
+  - handle: SiimLand
+    niche: Longevity / Biohacking
+  - handle: Physionic
+    niche: Longevity / Science
+  - handle: DrBradStanfield
+    niche: Longevity / Medicine
+  - handle: jamesbruton
+    niche: Robotics / DIY
+  - handle: BreakingTaps
+    niche: Robotics / Embedded
+  - handle: BenFelixCSI
+    niche: Finance / Investing
+  - handle: TheSwedishInvestor
+    niche: Finance / Education
+  - handle: ShashankKalanithi
+    niche: Data Engineering / Careers
+  - handle: DataVidhya
+    niche: Data / Tutorials
+  - handle: CodeWithYu
+    niche: Coding / Shorts
+  - handle: Electronoobs
+    niche: IoT / Arduino
+  - handle: nikodembartnik
+    niche: IoT / DIY Tech
