@@ -1,95 +1,199 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# docker-compose.yml — Chapter 3 local stack
+# docker-compose.yml — Chapter 4 local stack
 #
-# Today: one service, `collector`. Runs Collectorv2.py inside a container
-# with your data and logs bind-mounted so results land on the host.
+# Chapter 3 had one service (`collector`). Chapter 4 adds the orchestration
+# layer as four new services:
 #
-# Chapter 4 will add `postgres` and `airflow` services *to this same file*.
-# Keeping the compose file extensible from day one is the point.
+#   postgres            — Airflow's metadata store (DAG runs, task states, …)
+#   airflow-init        — one-shot: `db migrate` + admin user create, then exits
+#   airflow-scheduler   — parses DAGs, schedules task instances, runs forever
+#   airflow-webserver   — serves the UI at http://localhost:8080, runs forever
 #
-# Note: the top-level `version:` key is intentionally absent. Docker
-# Compose v2 (what you have with Docker Desktop) ignores it and warns you
-# when it's present. The modern convention is to omit it.
+# The collector service is unchanged — Airflow will invoke it via a
+# PythonOperator (commit 2) and later via DockerOperator (follow-up).
+#
+# The top-level `version:` key is intentionally absent: Compose v2 warns
+# if it's present.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Shared Airflow config (YAML anchor) ──────────────────────────────────────
+# The three Airflow services share the same image, env vars, and volume
+# mounts. Declaring them once with `&airflow-common` and re-using them via
+# `<<: *airflow-common` keeps the file DRY — one place to change the image
+# tag or Postgres connection string.
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.4-python3.10
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+  volumes:
+    # DAG code lives on the host — edits are picked up without rebuilding.
+    - ./dags:/opt/airflow/dags
+    # Airflow's own logs (task logs, scheduler heartbeats). Bind-mounted
+    # so you can tail them from the host: `tail -f logs/airflow/...`.
+    - ./logs/airflow:/opt/airflow/logs
+    # Shared bronze layer: the collector writes here, the DAG (and later
+    # dbt) reads from here. Same path as the collector service sees.
+    - ./data:/opt/airflow/data
+    # Config + channel list, read-only.
+    - ./config.yaml:/opt/airflow/config.yaml:ro
+    - ./competitors.csv:/opt/airflow/competitors.csv:ro
+  # UID handling: Airflow's official image expects UID 50000. Passing
+  # group 0 (root) lets the container write to bind-mounted folders on
+  # Linux without `sudo chown`. On Windows/WSL2 the UID is largely
+  # cosmetic — the NTFS layer handles ownership translation.
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - pipeline
+
 
 services:
 
+  # ── Postgres — Airflow metadata store ────────────────────────────────────
+  # Stateful service. Uses a NAMED volume (not a bind mount) because
+  # Postgres's internal page files are sensitive to filesystem latency,
+  # and bind-mounting them onto Windows is a well-known performance trap.
+  # Named volumes live inside Docker's managed disk (the WSL2 VM) and run
+  # at native speed.
+  postgres:
+    image: postgres:14-alpine
+    container_name: yt-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Other services gate on `condition: service_healthy` — the scheduler
+      # and webserver wait until Postgres actually accepts connections,
+      # not just until the process has started.
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - pipeline
+
+
+  # ── Airflow init — runs once, then exits ─────────────────────────────────
+  # Two jobs:
+  #   1. `airflow db migrate` — creates/updates Airflow's schema in Postgres.
+  #      Safe to run repeatedly; idempotent.
+  #   2. `airflow users create` — creates an admin user (admin/admin) if it
+  #      doesn't already exist. The `|| true` swallows the "already exists"
+  #      error on subsequent runs so `docker compose up` stays green.
+  #
+  # Scheduler + webserver depend on this succeeding — see their
+  # `condition: service_completed_successfully` gates below.
+  airflow-init:
+    <<: *airflow-common
+    container_name: yt-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --email admin@example.com \
+          --role Admin || true
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  # ── Airflow scheduler ────────────────────────────────────────────────────
+  # The brain. Continuously parses DAG files in /opt/airflow/dags, decides
+  # which task instances should run (per their schedule + dependency state),
+  # and hands them to the executor. With LocalExecutor, the executor is
+  # built into the scheduler process — tasks run as subprocesses here.
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: yt-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+
+  # ── Airflow webserver ────────────────────────────────────────────────────
+  # The UI. Login at http://localhost:8080 with admin/admin (POC creds —
+  # rotate before anything that faces the internet). Serves DAG graphs,
+  # task logs, run history, manual triggers.
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: yt-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+
+  # ── Collector (unchanged from Chapter 3) ─────────────────────────────────
   collector:
-    # Build the image from the Dockerfile next to this compose file.
-    # `args` lets us pass build-time variables (UID/GID) so the container's
-    # non-root user matches the host user. Critical on Linux/WSL2 to avoid
-    # "permission denied" when the container writes to bind-mounted folders.
     build:
       context: .
       dockerfile: Dockerfile
       args:
         UID: ${UID:-1000}
         GID: ${GID:-1000}
-
-    # Tag the built image with a predictable name. Without this, Docker
-    # auto-generates names like `youtube-collector-collector` which are
-    # ugly to type and non-obvious in `docker images`.
     image: youtube-collector:0.3.0
-
-    # Friendly container name. Without this, Docker appends a random suffix
-    # like `-1` every restart.
     container_name: yt-collector
-
-    # Inject secrets at runtime, NOT at build time. Anything in .env
-    # becomes an environment variable inside the container. The collector
-    # reads YOUTUBE_API_KEY via os.getenv(), so this is all it needs.
     env_file:
       - .env
-
-    # Bind mounts: host path : container path : mode
-    #
-    # Strategy (the "hybrid" pattern):
-    #   - Code-ish files (config.yaml, competitors.csv) are read-only (:ro).
-    #     The container never writes to them; making them read-only catches
-    #     accidental writes loudly at the kernel level.
-    #   - Data-ish folders (./data, ./logs) are read-write so the collector
-    #     can land parquet files and quota logs on your host filesystem.
-    #
-    # The `./` paths are relative to this compose file. On WSL2 this Just
-    # Works; on native Windows you'd use volume mounts instead because
-    # bind mounts are slow through the Hyper-V layer.
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
       - ./competitors.csv:/app/competitors.csv:ro
-
-    # Restart policy: `no` for a batch job. A daily collector that dies
-    # should stay dead and surface to the operator (you, today; Airflow,
-    # next chapter). Do NOT use `always` or `unless-stopped` for batch
-    # jobs — you'll get infinite retry loops if the API key is wrong.
     restart: "no"
-
-    # Memory/CPU guardrails. Optional, but healthy to set on laptops so a
-    # runaway pandas operation doesn't lock up your machine. These are
-    # generous defaults for the current workload (~12 channels × 10 videos).
     deploy:
       resources:
         limits:
           memory: 512M
           cpus: "1.0"
-
-    # Named network. Chapter 4 will put Airflow and Postgres on the same
-    # network so they can reach each other by service name.
     networks:
       - pipeline
 
 
 # ── Networks ────────────────────────────────────────────────────────────────
-# Declaring a user network explicitly (vs the default "bridge") gives us
-# DNS-based service discovery: `postgres` resolves to the postgres container
-# from any other container on this network. Prep for Chapter 4.
+# One user-defined bridge network. Every service on it can reach every
+# other by service name (the scheduler reaches Postgres at `postgres:5432`,
+# not by IP). Docker's built-in DNS handles the resolution.
 networks:
   pipeline:
     driver: bridge
 
 
 # ── Volumes (named) ─────────────────────────────────────────────────────────
-# Empty for now. Chapter 4 adds `postgres_data:` here for Airflow metadata
-# persistence. Documented here as a placeholder so the structure is obvious.
-volumes: {}
+# `postgres_data` survives `docker compose down`. To wipe it (and lose
+# all DAG run history), add `--volumes`: `docker compose down --volumes`.
+volumes:
+  postgres_data:

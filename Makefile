@@ -16,7 +16,7 @@
 # .PHONY tells make "these are commands, not files on disk". Without this,
 # if a file called `build` ever appeared in the folder, `make build` would
 # think there's nothing to do.
-.PHONY: help build run run-csv run-debug shell logs quota-today clean prune rebuild
+.PHONY: help build run run-csv run-debug shell logs quota-today clean prune rebuild airflow-up airflow-down airflow-logs airflow-ui
 
 # Default target when you just type `make`. Prints the list of commands.
 help:
@@ -32,6 +32,12 @@ help:
 	@echo "  make quota-today   Show today's API unit usage from logs/quota/"
 	@echo "  make clean         Remove stopped containers + dangling images"
 	@echo "  make prune         Aggressive cleanup — removes ALL unused images/volumes"
+	@echo ""
+	@echo "  Airflow (chapter 4):"
+	@echo "  make airflow-up    Start Postgres + Airflow stack (detached)"
+	@echo "  make airflow-down  Stop Airflow stack (keeps DAG history in postgres_data)"
+	@echo "  make airflow-logs  Tail scheduler + webserver logs"
+	@echo "  make airflow-ui    Print the UI URL + admin credentials"
 
 # Build honours the layer cache. Fast on re-runs when requirements.txt hasn't
 # changed. `--pull` refreshes the base image so we track upstream CVE fixes.
@@ -90,3 +96,31 @@ clean:
 # projects you care about on this machine.
 prune:
 	docker system prune -af --volumes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chapter 4 — Airflow stack
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Start Postgres + the three Airflow services in the background. The init
+# service runs once (db migrate + admin user create) then exits; scheduler
+# and webserver stay up via `restart: unless-stopped`. The UI takes ~30s
+# to become reachable after this command returns.
+airflow-up:
+	docker compose up -d postgres airflow-init airflow-scheduler airflow-webserver
+
+# Stop Airflow services cleanly. The `postgres_data` named volume is
+# preserved, so DAG run history and the admin account survive restarts.
+# To wipe metadata too, add `--volumes`: `docker compose down --volumes`.
+airflow-down:
+	docker compose down
+
+# Tail scheduler + webserver logs interleaved. Handy when a DAG fails and
+# you want to see what's happening in the scheduler without opening the UI.
+airflow-logs:
+	docker compose logs -f --tail=100 airflow-scheduler airflow-webserver
+
+# Friendly reminder of where the UI lives and what creds to use.
+airflow-ui:
+	@echo "Airflow UI: http://localhost:8080"
+	@echo "Login:      admin / admin   (POC creds — rotate before exposing)"

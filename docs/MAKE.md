@@ -19,12 +19,23 @@ Shortcuts over the raw `docker compose` CLI. Run `make help` anytime for a termi
 | `make logs` | Last 200 lines of the most recent collector container's logs | 0 |
 | `make quota-today` | Prints today's API unit usage (reads `logs/quota/*.jsonl` on the host) | 0 |
 
+## Airflow stack (Chapter 4)
+
+The collector commands above work **independently** of Airflow — you can `make run` whether the stack is up or not.
+
+| Command | What it does |
+|---|---|
+| `make airflow-up` | Starts Postgres + 3 Airflow services (detached). First run pulls ~1 GB image |
+| `make airflow-down` | Stops Airflow services. `postgres_data` volume survives — DAG history preserved |
+| `make airflow-logs` | Tails scheduler + webserver logs interleaved (`Ctrl+C` to exit) |
+| `make airflow-ui` | Prints the UI URL + admin credentials |
+
 ## General / cleanup
 
 | Command | What it does |
 |---|---|
 | `make help` | Prints all targets with one-line descriptions |
-| `make clean` | `docker compose down` + removes dangling images |
+| `make clean` | `docker compose down` + removes dangling images. Postgres data survives |
 | `make prune` | ⚠️ Nuclear: wipes **all** unused Docker resources system-wide (not just this project) |
 
 ---
@@ -56,10 +67,26 @@ make shell                # drops you into bash
 make run-csv              # writes data/raw/.../video_stats.csv
 ```
 
+### Develop a DAG
+
+```bash
+make airflow-up           # once — leave running while you work
+# edit dags/airflow_dag_v1.py — scheduler auto-picks it up within ~30s
+make airflow-logs         # watch the scheduler parse your DAG
+```
+
 ### End-of-day cleanup
 
 ```bash
-make clean                # stop containers + prune dangling images
+make airflow-down         # stop Airflow services (keeps DAG history)
+make clean                # stop any stray container + prune dangling images
+```
+
+### Nuke everything and start fresh
+
+```bash
+docker compose down --volumes    # wipes postgres_data — loses DAG history
+make airflow-up                  # fresh metadata DB, admin/admin recreated
 ```
 
 ---
@@ -68,7 +95,3 @@ make clean                # stop containers + prune dangling images
 
 - [COLLECTORV2.md](COLLECTORV2.md) — run the collector without Docker (via venv + direct Python)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — why the Makefile exists, the Docker layering rationale
-
----
-
-*Chapter 4 will add Airflow-related targets (`airflow-up`, `airflow-down`, `airflow-logs`, `airflow-ui`). This doc will be extended at that point.*
