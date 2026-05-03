@@ -249,6 +249,46 @@ else:
     )
 
 
+# ── Curator queue · candidates (chapter 6 commit 3) ─────────────────────────
+
+st.header("Curator queue · candidates")
+
+candidates_csv = WAREHOUSE.parents[1] / "curator" / "candidates.csv"
+
+if candidates_csv.exists():
+    cand_df = pd.read_csv(candidates_csv)
+    status_counts = cand_df["status"].fillna("pending").value_counts().to_dict()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",    len(cand_df))
+    c2.metric("Pending",  int(status_counts.get("pending",  0)))
+    c3.metric("Accepted", int(status_counts.get("accepted", 0)))
+    c4.metric("Rejected", int(status_counts.get("rejected", 0)))
+
+    pending = cand_df[cand_df["status"].fillna("pending") == "pending"].copy()
+    if len(pending):
+        st.markdown(
+            "**Pending review** — sorted by subscribers DESC. "
+            "Edit `data/curator/candidates.csv` to flip `status` to `accepted` or `rejected`."
+        )
+        cols = [
+            "handle", "name", "niche", "tier",
+            "subscribers", "last_published_at", "notes",
+        ]
+        present_cols = [c for c in cols if c in pending.columns]
+        st.dataframe(
+            pending.sort_values("subscribers", ascending=False, kind="mergesort")[present_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+else:
+    coming_soon(
+        "`candidates.csv`",
+        "Chapter 6 commit 3 — `scripts/discover.py` validates AI-sourced "
+        "candidates against the YouTube API and writes the queue here."
+    )
+
+
 # ── Silver — snapshot activity ───────────────────────────────────────────────
 
 st.header("Silver · snapshot activity")
