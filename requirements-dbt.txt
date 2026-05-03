@@ -1,0 +1,5 @@
+# dbt deps (kept separate from collector requirements.txt so the collector
+# image stays slim — chapter 5 part 2 will install these into the Airflow
+# image via _PIP_ADDITIONAL_REQUIREMENTS, not the collector image).
+dbt-core>=1.7,<1.9
+dbt-duckdb>=1.7,<1.9

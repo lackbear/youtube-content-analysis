@@ -1,0 +1,30 @@
+name: dbt_youtube
+version: 1.0.0
+config-version: 2
+
+# Profile name — must match the top-level key in profiles.yml.
+profile: youtube
+
+model-paths:   ["models"]
+seed-paths:    ["seeds"]
+test-paths:    ["tests"]
+macro-paths:   ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: target
+clean-targets:
+  - target
+  - dbt_packages
+
+# Layered config: silver and gold get their own DuckDB schemas + tags so
+# Airflow can run them selectively (`dbt run --select tag:silver`).
+models:
+  dbt_youtube:
+    silver:
+      +schema: silver
+      +materialized: table
+      +tags: ["silver"]
+    gold:
+      +schema: gold
+      +materialized: table
+      +tags: ["gold"]

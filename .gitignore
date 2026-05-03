@@ -42,6 +42,14 @@ data/
 logs/
 video_stats.csv
 
+# ── dbt ──────────────────────────────────────────────────────────────────────
+# Compiled SQL, manifest, run_results.json — all regenerated on every
+# `dbt run`. The `logs/` rule above already covers `dbt_youtube/logs/`.
+dbt_youtube/target/
+dbt_youtube/dbt_packages/
+# Per-machine dbt CLI config (anonymous-usage opt-in flag).
+.user.yml
+
 # ── Docker ───────────────────────────────────────────────────────────────────
 # Compose overrides (for personal local tweaks) should stay local.
 docker-compose.override.yml

@@ -1,0 +1,22 @@
+version: 2
+
+# Bronze sources — the collector's per-channel parquet snapshots. dbt
+# never owns these files; the collector writes them, dbt only reads.
+#
+# `meta.external_location` is a dbt-duckdb feature: the adapter rewrites
+# `{{ source('bronze', 'video_stats') }}` to the SQL expression below at
+# compile time. `hive_partitioning=true` makes DuckDB extract the
+# `date=...` and `channel_id=...` folder names as virtual columns, so we
+# don't have to join paths back in.
+sources:
+  - name: bronze
+    description: |
+      Raw collector output (Hive-partitioned by date + channel_id).
+      Written by Collectorv2.py one parquet file per (date, channel) pair.
+      All stat columns (views, likes, comments) are still strings here —
+      casting to integers happens in silver.
+    tables:
+      - name: video_stats
+        description: Per-video stats snapshot. One row per video per run.
+        meta:
+          external_location: "read_parquet('../data/raw/video_stats/date=*/channel_id=*/video_stats.parquet', hive_partitioning=true, union_by_name=true)"

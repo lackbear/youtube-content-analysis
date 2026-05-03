@@ -1,0 +1,16 @@
+# Project-local profile — kept inside the dbt project so the whole
+# warehouse config is version-controlled and works identically on a
+# laptop and inside the Airflow container. dbt finds it via the
+# --profiles-dir flag or the DBT_PROFILES_DIR env var.
+#
+# DuckDB file is bind-mounted to ../data/warehouse/dev.duckdb (relative
+# to this project root). The data/ folder is gitignored so the DuckDB
+# state never lands in git.
+youtube:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: ../data/warehouse/dev.duckdb
+      threads: 4
+      schema: main
