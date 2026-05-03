@@ -1,19 +1,24 @@
 """
-airflow_dag_v1.py — YouTube data pipeline orchestration (chapter 4)
+youtube_pipeline (PythonOperator variant) — chapter 5 commit 2a
 
-First DAG for the project. Per the single-file-per-chapter convention,
-future significant changes will land as airflow_dag_v2.py so the diff
-narrates the evolution (adding DockerOperator, dbt integration, etc.).
+Sibling of dags/bash_operator/youtube_pipeline.py. Same shape, same
+schedule, same default_args. The only difference: dbt_silver and dbt_gold
+use PythonOperator (a Python callable that will subprocess-run the dbt
+CLI in commit 2b) instead of BashOperator. Both DAGs produce identical
+warehouse output.
+
+Use whichever fits the situation — PythonOperator wins when you want
+pre-flight logic, custom error handling, or programmatic stdout capture
+around the dbt invocation; BashOperator (sibling DAG) wins for the most
+idiomatic, least-layered dbt-on-Airflow pattern.
 
 Shape — Option C: one task per service boundary.
 
     collect  →  dbt_silver  →  dbt_gold  →  notify
-    (Python)    (placeholder)  (placeholder)  (placeholder)
 
 Only `collect` does real work today. The dbt and notify tasks are
-placeholders that just print — chapters 5 and 6 will wire them up.
-Keeping them in the DAG now means the shape is visible end-to-end and
-the dependency chain is locked in.
+placeholders that just print; commit 5.2b replaces dbt_silver/dbt_gold
+with real `subprocess.run(["dbt", "run", "--select", "tag:..."])` calls.
 
 Retry policy:
     Default              → retries=2, retry_delay=10min
@@ -88,14 +93,14 @@ default_args = {
 
 
 with DAG(
-    dag_id="youtube_pipeline",
-    description="YouTube competitor data pipeline — collect, transform, notify.",
+    dag_id="youtube_pipeline_python",
+    description="YouTube pipeline — PythonOperator dbt variant. Sibling: youtube_pipeline_bash.",
     start_date=datetime(2026, 4, 19),
     schedule="0 8 * * *",          # 08:00 UTC daily
     catchup=False,                 # never backfill: stale snapshots aren't useful
     max_active_runs=1,             # no concurrent runs; avoids quota double-spend
     default_args=default_args,
-    tags=["youtube", "bronze", "chapter-4"],
+    tags=["youtube", "bronze", "chapter-5", "python_operator"],
 ) as dag:
 
     collect = PythonOperator(
