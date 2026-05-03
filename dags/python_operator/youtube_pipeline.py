@@ -64,14 +64,47 @@ def run_collector(**context):
         ) from e
 
 
+def _run_dbt(select_arg: str) -> None:
+    """
+    Subprocess-run `dbt run --select <arg>` from /opt/airflow/dbt_youtube.
+
+    PythonOperator-flavoured invocation. Pros over BashOperator (sibling DAG):
+      - Pre-flight Python logic could land here (e.g. quota check, freshness
+        gate, custom logging) without leaving Python.
+      - Stdout/stderr captured programmatically — useful when we eventually
+        want to parse `run_results.json` and surface model-level metrics.
+      - Errors raise as Python exceptions, so AirflowFailException can pin
+        retry semantics on specific failure modes.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        ["dbt", "run", "--select", select_arg],
+        cwd="/opt/airflow/dbt_youtube",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Stream both streams to the Airflow task log. Order: stdout first
+    # (success messages, model timings) then stderr (warnings, errors) —
+    # easier to read top-down.
+    sys.stdout.write(result.stdout or "")
+    sys.stderr.write(result.stderr or "")
+    if result.returncode != 0:
+        raise AirflowFailException(
+            f"dbt run --select {select_arg} failed (exit code {result.returncode})"
+        )
+
+
 def run_dbt_silver(**context):
-    """Placeholder — chapter 5 will replace with `dbt run --select tag:silver`."""
-    print("[placeholder] dbt silver models will run here (chapter 5).")
+    """Build the silver tier."""
+    _run_dbt("tag:silver")
 
 
 def run_dbt_gold(**context):
-    """Placeholder — chapter 5 will replace with `dbt run --select tag:gold`."""
-    print("[placeholder] dbt gold models will run here (chapter 5).")
+    """Build the gold tier."""
+    _run_dbt("tag:gold")
 
 
 def notify(**context):

@@ -29,12 +29,12 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-    # POC pattern: install the collector's runtime deps on container startup.
-    # Adds ~30–60s to first boot; subsequent starts are cached by pip.
+    # POC pattern: install runtime deps (collector + dbt) on container startup.
+    # Adds ~1–2 min to first boot; subsequent starts are cached by pip.
     # Production replacement: build a custom Airflow image with these baked in
     # (FROM apache/airflow:... + RUN pip install ...). Documented as a
     # follow-up in chapter 5.
-    _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow google-api-python-client pyyaml python-dotenv"
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow google-api-python-client pyyaml python-dotenv dbt-core dbt-duckdb"
     # Make /opt/airflow importable so `from ingestion.Collectorv2 import run`
     # works from the DAG. Airflow only adds dags_folder and plugins_folder to
     # sys.path by default — the project root is not on it.
@@ -42,6 +42,9 @@ x-airflow-common: &airflow-common
     # Absolute path to config.yaml so Collectorv2 loads it regardless of
     # whatever cwd the task subprocess inherits.
     COLLECTOR_CONFIG: "/opt/airflow/config.yaml"
+    # dbt looks here for profiles.yml. Setting it in the env beats passing
+    # --profiles-dir on every dbt invocation in the DAGs.
+    DBT_PROFILES_DIR: "/opt/airflow/dbt_youtube"
   # YOUTUBE_API_KEY gets injected via .env (read by docker compose, propagated
   # to the Airflow containers so the collect task can hit the YouTube API).
   env_file:
@@ -64,6 +67,12 @@ x-airflow-common: &airflow-common
     # __init__.py) makes the package discoverable; PYTHONPATH=/opt/airflow
     # then makes `from ingestion.Collectorv2 import run` resolve natively.
     - ./ingestion:/opt/airflow/ingestion:ro
+    # dbt project — both DAGs (python_operator and bash_operator variants)
+    # invoke dbt against this folder. Read-write because dbt writes
+    # target/ (compiled SQL, manifest, run_results) and logs/ here on
+    # every run. Same folder, same models, same warehouse — switching
+    # which DAG is unpaused in the UI changes only how dbt is invoked.
+    - ./dbt_youtube:/opt/airflow/dbt_youtube
     # Config + channel list, read-only.
     - ./config.yaml:/opt/airflow/config.yaml:ro
     - ./competitors.csv:/opt/airflow/competitors.csv:ro

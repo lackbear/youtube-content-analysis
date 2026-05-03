@@ -99,18 +99,18 @@ with DAG(
         python_callable=run_collector,
     )
 
-    # Placeholder dbt tasks — commit 5.2b replaces with the real invocation:
-    #   bash_command="cd /opt/airflow/dbt_youtube && dbt run --select tag:silver"
-    # Locking the operator type in NOW means the swap to real dbt is a
-    # bash_command edit only — no DAG-shape change in 5.2b.
+    # Real dbt invocations. The shell `cd` is necessary because dbt resolves
+    # relative paths (the DuckDB profile path, the bronze parquet glob in
+    # sources.yml) from cwd. DBT_PROFILES_DIR (set in docker-compose) tells
+    # dbt where profiles.yml lives — no --profiles-dir flag needed.
     dbt_silver = BashOperator(
         task_id="dbt_silver",
-        bash_command='echo "[placeholder] dbt silver models will run here (chapter 5.2b)."',
+        bash_command="cd /opt/airflow/dbt_youtube && dbt run --select tag:silver",
     )
 
     dbt_gold = BashOperator(
         task_id="dbt_gold",
-        bash_command='echo "[placeholder] dbt gold models will run here (chapter 5.2b)."',
+        bash_command="cd /opt/airflow/dbt_youtube && dbt run --select tag:gold",
     )
 
     notify_task = PythonOperator(
