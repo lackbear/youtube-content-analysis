@@ -93,6 +93,12 @@ If 200 in a single response stretches your context, do this in 6 separate runs o
 
 ---
 
+## Example of the expected output
+
+See [`candidates_input.example.csv`](candidates_input.example.csv) next to this file — 10 illustrative rows showing the exact format and column values. The handles in the example are real well-known channels in each niche; the tier assignments are illustrative (the AI you run the prompt against should verify subscriber counts before committing to a tier).
+
+---
+
 ## After running the prompt
 
 1. Concatenate the 6 batches' CSV outputs into a single `data/curator/candidates_input.csv` (project-root path).
