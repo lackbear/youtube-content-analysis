@@ -140,6 +140,111 @@ def _evict_oldest_inactive(competitors: pd.DataFrame, today_str: str):
     return competitors.drop(index=victim.name).copy(), victim
 
 
+def bulk_import(dry_run: bool = False) -> int:
+    """
+    Bulk-import mode: append every `accepted` candidate to competitors.csv
+    as a new active row, without requiring a stale slot. Used for initial
+    registry fill (chapter 6 first 200 channels) where there's no
+    1-for-1 replacement to do.
+
+    Subject to the same 200-row cap and FIFO eviction logic as the
+    replacement mode.
+
+    Workflow:
+      python scripts/promote_candidates.py --bulk            # apply
+      python scripts/promote_candidates.py --bulk --dry-run  # simulate
+    """
+    if not all(p.exists() for p in (COMPETITORS_CSV, CANDIDATES_CSV)):
+        missing = [str(p) for p in (COMPETITORS_CSV, CANDIDATES_CSV) if not p.exists()]
+        raise FileNotFoundError(f"Missing required input(s): {missing}")
+
+    competitors = pd.read_csv(COMPETITORS_CSV, dtype=str, keep_default_na=False)
+    candidates  = pd.read_csv(CANDIDATES_CSV,  dtype=str, keep_default_na=False)
+    accepted    = candidates[candidates["status"].str.strip().str.lower() == "accepted"].copy()
+
+    print(f"  candidates accepted (eligible to bulk-import): {len(accepted)}")
+    if len(accepted) == 0:
+        print("  nothing to do.")
+        return 0
+
+    max_size  = _load_max_registry_size()
+    today_str = date.today().isoformat()
+    prefix    = "[DRY-RUN] " if dry_run else ""
+    print(f"  registry cap: {max_size} rows; current: {len(competitors)}")
+
+    new_rows           = []
+    promoted_handles   = []
+    n_skipped_cap      = 0
+    n_skipped_dup      = 0
+    predicted_size     = len(competitors)
+    seen_ids           = set(competitors["channel_id"].str.strip()) | {""}
+
+    for _, cand in accepted.iterrows():
+        # Defensive dedup against competitors.csv state — discover.py already
+        # excludes anything in competitors.csv, but during a long curation
+        # cycle a candidate could be added to competitors via another path.
+        if cand["channel_id"].strip() in seen_ids:
+            n_skipped_dup += 1
+            continue
+
+        if predicted_size >= max_size:
+            new_competitors, evicted = _evict_oldest_inactive(competitors, today_str)
+            if evicted is None:
+                print(
+                    f"  {prefix}[skip-cap] cannot import {cand['handle']}: "
+                    f"registry at cap ({max_size}) and no evictable inactive row."
+                )
+                n_skipped_cap += 1
+                continue
+            competitors = new_competitors
+            predicted_size -= 1
+            print(
+                f"  {prefix}[evict]      {evicted['handle']:<25} "
+                f"(was inactive since {evicted['deactivated_date']})"
+            )
+
+        new_rows.append({
+            "handle":                  cand["handle"],
+            "channel_id":              cand["channel_id"],
+            "name":                    cand["name"],
+            "niche":                   cand["niche"],
+            "tier":                    cand["tier"],
+            "subscribers_at_addition": cand.get("subscribers", ""),
+            "added_date":              today_str,
+            "active":                  "true",
+            "deactivated_date":        "",
+            "deactivated_reason":      "",
+        })
+        promoted_handles.append(cand["handle"])
+        seen_ids.add(cand["channel_id"].strip())
+        predicted_size += 1
+        print(
+            f"  {prefix}[add]   {cand['handle']:<25} "
+            f"({cand['niche']}, {cand['tier']}, {cand.get('subscribers','?')} subs)"
+        )
+
+    summary = (
+        f"  {len(promoted_handles)} added, {n_skipped_dup} dup-skipped, "
+        f"{n_skipped_cap} cap-skipped. Final registry size: {predicted_size}/{max_size}."
+    )
+
+    if dry_run:
+        print(f"  [DRY-RUN] {summary} No files modified.")
+        return len(promoted_handles)
+
+    new_df = pd.DataFrame(new_rows, columns=competitors.columns)
+    competitors_out = pd.concat([competitors, new_df], ignore_index=True)
+    competitors_out.to_csv(COMPETITORS_CSV, index=False)
+
+    promoted_mask = candidates["handle"].isin(promoted_handles)
+    candidates.loc[promoted_mask, "status"] = "promoted"
+    candidates.to_csv(CANDIDATES_CSV, index=False)
+
+    print(summary)
+    print(f"  Wrote {COMPETITORS_CSV} and {CANDIDATES_CSV}.")
+    return len(promoted_handles)
+
+
 def promote(dry_run: bool = False) -> int:
     """
     Apply (or simulate) the queue replacement. Returns number of
@@ -260,6 +365,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Print what would happen, don't modify files.",
     )
+    parser.add_argument(
+        "--bulk",
+        action="store_true",
+        help=(
+            "Bulk-import all accepted candidates as new active rows in "
+            "competitors.csv (initial-fill mode, no stale-slot pairing required). "
+            "Default mode is the 1-for-1 replacement loop."
+        ),
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    promote(dry_run=args.dry_run)
+    if args.bulk:
+        bulk_import(dry_run=args.dry_run)
+    else:
+        promote(dry_run=args.dry_run)

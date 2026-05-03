@@ -14,20 +14,25 @@ with bronze as (
     select * from {{ source('bronze', 'video_stats') }}
 )
 
+-- nullif(...,''):: pattern: YouTube returns empty strings (not zeros) when
+-- like/comment counts are hidden by the channel or disabled on the video.
+-- The bare cast(...as bigint) raises on those rows. Treating them as NULL
+-- is correct semantically (we don't know the count) and gold's arithmetic
+-- propagates NULL cleanly.
 select
     video_id,
     channel_id,
     channel_name,
     title,
-    cast(published_at as timestamp)        as published_at,
-    cast(views    as bigint)               as views,
-    cast(likes    as bigint)               as likes,
-    cast(comments as bigint)               as comments,
-    duration                                as duration_iso,
+    nullif(published_at, '')::timestamp        as published_at,
+    nullif(views,    '')::bigint               as views,
+    nullif(likes,    '')::bigint               as likes,
+    nullif(comments, '')::bigint               as comments,
+    duration                                    as duration_iso,
     category_id,
     thumbnail_url,
-    cast(fetched_date as date)             as fetched_date,
-    cast(ingestion_timestamp as timestamp) as ingestion_timestamp,
+    nullif(fetched_date, '')::date             as fetched_date,
+    nullif(ingestion_timestamp, '')::timestamp as ingestion_timestamp,
     status
 from bronze
 where status = 'clean'
