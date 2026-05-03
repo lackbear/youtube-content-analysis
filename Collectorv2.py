@@ -102,6 +102,15 @@ QUOTA_LIMIT     = int(_cfg["api"].get("quota_limit",      10_000))
 QUOTA_WARN_PCT  = float(_cfg["api"].get("quota_warn_pct", 0.80))   # 80 %
 QUOTA_STOP_PCT  = float(_cfg["api"].get("quota_stop_pct", 0.95))   # 95 %
 
+
+# ── V2.1: Quota-exhaustion signal ────────────────────────────────────────────
+# Raised by run() when the hard-stop threshold (95 %) is crossed. Airflow's
+# task wrapper catches this and converts it to an AirflowFailException with
+# retries=0 — retrying 10 minutes later won't help because YouTube's quota
+# resets at PT midnight, not on demand.
+class QuotaExhaustedError(RuntimeError):
+    """Raised when the daily YouTube API quota hard-stop is reached."""
+
 # All attributes the script knows how to fetch.
 # Each maps to: (api_part, extraction_fn(stats, contentDetails, snippet))
 ATTRIBUTE_MAP = {
@@ -561,17 +570,37 @@ def write_output(rows, attributes, today_str):
 
 def run(channels=None, max_videos=None, attributes=None):
     """
-    Daily YouTube competitor collector (v2).
+    Daily YouTube competitor collector (v2.1).
 
     Lifecycle:
         1. Preflight (config + env).
-        2. V2: Quota preflight — estimate units, abort if >= 95 % of daily limit.
+        2. Quota preflight — estimate units, raise QuotaExhaustedError at 95 %.
         3. Resolve channels via channels.list.
         4. Load cache from both legacy and sub-partitioned layouts.
         5. Build fetch queue via playlistItems.list.
         6. Fetch stats via videos.list (batched).
-        7. V2: Write to per-channel sub-partitions with ingestion_timestamp.
-        8. V2: Record quota usage (append one line to logs/quota/…jsonl).
+        7. Write to per-channel sub-partitions with ingestion_timestamp.
+        8. Record quota usage (append one line to logs/quota/…jsonl).
+
+    V2.1 changes (chapter 4 — orchestration readiness):
+      * The entire run is wrapped in try/finally, so `record_quota_usage` ALWAYS
+        fires, even on mid-run exceptions. Closes a leak where units spent
+        before a crash were never recorded (the retry would then under-estimate
+        today's usage and could burn more units).
+      * Units are tracked incrementally (`units_spent += 1` per API call) rather
+        than estimated after the fact. More accurate when resolution partially
+        fails.
+      * Quota hard-stop now raises QuotaExhaustedError instead of returning
+        silently. Surfaces as a visible failure in Airflow's UI; the DAG pins
+        `retries=0` for this specific error because the quota won't reset
+        before the next retry window anyway.
+      * New `run_outcome` value: "failed" (unhandled exception during run).
+        Existing values — "success", "no_work", "aborted_over_quota" — unchanged.
+
+    Raises:
+        QuotaExhaustedError — when the 95 % hard-stop is crossed at preflight.
+        Any other unhandled exception from the fetch/write phases propagates;
+        quota usage for whatever units were spent is still recorded.
     """
     # Fall back to config.yaml values if not explicitly passed
     if channels    is None: channels    = DEFAULT_CHANNELS
@@ -581,127 +610,140 @@ def run(channels=None, max_videos=None, attributes=None):
     preflight(channels, max_videos, attributes)
     log_event("run_start", channels=channels, max_videos=max_videos, attributes=attributes)
 
-    # ── V2: Quota preflight ────────────────────────────────────────────────
-    estimated = estimate_run_units(len(channels), max_videos, BATCH_SIZE)
-    decision  = quota_preflight(estimated)
-    if decision == "abort":
-        log.error(
-            f"Quota hard-stop reached ({int(QUOTA_STOP_PCT*100)} % of {QUOTA_LIMIT}). "
-            f"Aborting before any API call."
-        )
-        log_event("run_aborted", reason="quota_hard_stop", estimated_units=estimated)
-        record_quota_usage(
-            units_this_run = 0,
-            channels       = len(channels),
-            videos_fetched = 0,
-            outcome        = "aborted_over_quota",
-        )
-        return
-    if decision == "warn":
-        log.warning(
-            f"Quota soft warning — projected usage will cross "
-            f"{int(QUOTA_WARN_PCT*100)} % of daily quota. Continuing."
-        )
+    # State that must be recorded regardless of how run() exits.
+    # Pessimistic defaults — overwritten on clean paths, preserved on crash.
+    units_spent      = 0
+    videos_fetched   = 0
+    channels_touched = len(channels)
+    outcome          = "failed"
+    resolved         = []
 
-    youtube   = _build_client()
-    today     = datetime.now(timezone.utc).date()
-    today_str = today.isoformat()
+    try:
+        # ── Quota preflight ────────────────────────────────────────────────
+        estimated = estimate_run_units(len(channels), max_videos, BATCH_SIZE)
+        decision  = quota_preflight(estimated)
+        if decision == "abort":
+            log.error(
+                f"Quota hard-stop reached ({int(QUOTA_STOP_PCT*100)} % of {QUOTA_LIMIT}). "
+                f"Aborting before any API call."
+            )
+            log_event("run_aborted", reason="quota_hard_stop", estimated_units=estimated)
+            outcome = "aborted_over_quota"
+            raise QuotaExhaustedError(
+                f"Quota hard-stop reached ({int(QUOTA_STOP_PCT*100)}% of {QUOTA_LIMIT}). "
+                f"No API calls made this run."
+            )
+        if decision == "warn":
+            log.warning(
+                f"Quota soft warning — projected usage will cross "
+                f"{int(QUOTA_WARN_PCT*100)} % of daily quota. Continuing."
+            )
 
-    # ── Resolve channels ───────────────────────────────────────────────────
-    log.info("Resolving channels...")
-    resolved = [ch for ch in
-                (resolve_channel(youtube, c) for c in channels)
-                if ch]
-    log.info(f"Resolved {len(resolved)}/{len(channels)} channels")
-    for ch in resolved:
-        log_event("channel_resolved", handle=ch["name"], channel_id=ch["channel_id"])
+        youtube   = _build_client()
+        today     = datetime.now(timezone.utc).date()
+        today_str = today.isoformat()
 
-    if not resolved:
-        log.error("No channels resolved. Aborting.")
-        # Resolution calls still cost units, so record whatever we spent.
-        record_quota_usage(
-            units_this_run = len(channels),
-            channels       = len(channels),
-            videos_fetched = 0,
-            outcome        = "no_work",
-        )
-        return
+        # ── Resolve channels ───────────────────────────────────────────────
+        log.info("Resolving channels...")
+        for c in channels:
+            ch = resolve_channel(youtube, c)
+            units_spent += 1   # channels.list is billed per attempt, success or not
+            if ch:
+                resolved.append(ch)
+                log_event("channel_resolved", handle=ch["name"], channel_id=ch["channel_id"])
+        channels_touched = len(resolved) or len(channels)
+        log.info(f"Resolved {len(resolved)}/{len(channels)} channels")
 
-    # ── Load cache (reads both layouts) ────────────────────────────────────
-    seen = load_seen_videos()
+        if not resolved:
+            log.error("No channels resolved. Aborting.")
+            outcome = "no_work"
+            return
 
-    # ── Phase 1: build fetch queue ─────────────────────────────────────────
-    fetch_queue = []
+        # ── Load cache (reads both layouts) ────────────────────────────────
+        seen = load_seen_videos()
 
-    for channel in resolved:
-        log.info(f"Scanning {channel['name']}...")
-        for video_id, published_at, title in get_latest_videos(youtube, channel, max_videos):
-            if should_fetch(video_id, published_at, seen, today):
-                fetch_queue.append((channel, video_id, published_at, title))
+        # ── Phase 1: build fetch queue ─────────────────────────────────────
+        fetch_queue = []
+        for channel in resolved:
+            log.info(f"Scanning {channel['name']}...")
+            for video_id, published_at, title in get_latest_videos(youtube, channel, max_videos):
+                if should_fetch(video_id, published_at, seen, today):
+                    fetch_queue.append((channel, video_id, published_at, title))
+                else:
+                    log.debug(f"  Skipping {video_id} (cached / too old)")
+            units_spent += 1   # playlistItems.list — one per resolved channel
+
+        log.info(f"Videos queued: {len(fetch_queue)}")
+        log_event("videos_queued", count=len(fetch_queue))
+
+        if not fetch_queue:
+            log.info("Nothing new to fetch — all done.")
+            log_event(
+                "run_complete",
+                clean=0, missing=0,
+                api_units=units_spent,
+                skipped_reason="nothing_new",
+            )
+            outcome = "no_work"
+            return
+
+        # ── Phase 2: fetch stats ───────────────────────────────────────────
+        video_ids = [item[1] for item in fetch_queue]
+        stats_map = fetch_stats_batch(youtube, video_ids, attributes)
+        units_spent += math.ceil(len(video_ids) / BATCH_SIZE)  # videos.list batches
+
+        # ── Phase 3: build + write rows ────────────────────────────────────
+        rows          = []
+        clean_count   = 0
+        missing_count = 0
+
+        for channel, video_id, published_at, title in fetch_queue:
+            stats  = stats_map.get(video_id)
+            status = "clean" if stats else "missing"
+
+            row = {
+                "fetched_date" : today_str,
+                "channel_id"   : channel["channel_id"],
+                "channel_name" : channel["name"],
+                "video_id"     : video_id,
+                "title"        : title,
+                "published_at" : published_at,
+                "status"       : status,
+            }
+            if stats:
+                row.update(stats)
             else:
-                log.debug(f"  Skipping {video_id} (cached / too old)")
+                row.update({attr: "" for attr in attributes})
 
-    log.info(f"Videos queued: {len(fetch_queue)}")
-    log_event("videos_queued", count=len(fetch_queue))
+            rows.append(row)
+            clean_count   += (status == "clean")
+            missing_count += (status == "missing")
 
-    if not fetch_queue:
-        log.info("Nothing new to fetch — all done.")
-        log_event("run_complete", clean=0, missing=0, api_units=0, skipped_reason="nothing_new")
-        # Resolution + playlistItems still cost units.
-        units = len(resolved) + len(resolved)
+        write_output(rows, attributes, today_str)
+        videos_fetched = clean_count + missing_count
+
+        log.info(f"Done — {clean_count} clean, {missing_count} missing, ~{units_spent} API units used.")
+        log_event("run_complete", clean=clean_count, missing=missing_count, api_units=units_spent)
+        outcome = "success"
+
+    except QuotaExhaustedError:
+        # outcome already set to "aborted_over_quota" above; event already emitted.
+        raise
+    except Exception as e:
+        # Anything else — API blew up, disk full, permission denied, etc.
+        # outcome stays "failed" so the finally block records it, then re-raise
+        # so Airflow sees the task as failed.
+        log.error(f"Unhandled error during run: {e}")
+        log_event("run_error", error=str(e))
+        raise
+    finally:
+        # ALWAYS runs — closes the "units spent before a crash went unrecorded" leak.
         record_quota_usage(
-            units_this_run = units,
-            channels       = len(resolved),
-            videos_fetched = 0,
-            outcome        = "no_work",
+            units_this_run = units_spent,
+            channels       = channels_touched,
+            videos_fetched = videos_fetched,
+            outcome        = outcome,
         )
-        return
-
-    # ── Phase 2: fetch stats ───────────────────────────────────────────────
-    video_ids = [item[1] for item in fetch_queue]
-    stats_map = fetch_stats_batch(youtube, video_ids, attributes)
-
-    # ── Phase 3: build + write rows ────────────────────────────────────────
-    rows          = []
-    clean_count   = 0
-    missing_count = 0
-
-    for channel, video_id, published_at, title in fetch_queue:
-        stats  = stats_map.get(video_id)
-        status = "clean" if stats else "missing"
-
-        row = {
-            "fetched_date" : today_str,
-            "channel_id"   : channel["channel_id"],
-            "channel_name" : channel["name"],
-            "video_id"     : video_id,
-            "title"        : title,
-            "published_at" : published_at,
-            "status"       : status,
-        }
-        if stats:
-            row.update(stats)
-        else:
-            row.update({attr: "" for attr in attributes})
-
-        rows.append(row)
-        clean_count   += (status == "clean")
-        missing_count += (status == "missing")
-
-    write_output(rows, attributes, today_str)
-
-    # Actual units: resolve (1/ch) + playlistItems (1/ch) + videos.list batches.
-    units = len(resolved) + len(resolved) + math.ceil(len(video_ids) / BATCH_SIZE)
-    log.info(f"Done — {clean_count} clean, {missing_count} missing, ~{units} API units used.")
-    log_event("run_complete", clean=clean_count, missing=missing_count, api_units=units)
-
-    # ── V2: record quota usage ─────────────────────────────────────────────
-    record_quota_usage(
-        units_this_run = units,
-        channels       = len(resolved),
-        videos_fetched = clean_count + missing_count,
-        outcome        = "success",
-    )
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

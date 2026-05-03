@@ -29,15 +29,40 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # POC pattern: install the collector's runtime deps on container startup.
+    # Adds ~30–60s to first boot; subsequent starts are cached by pip.
+    # Production replacement: build a custom Airflow image with these baked in
+    # (FROM apache/airflow:... + RUN pip install ...). Documented as a
+    # follow-up in chapter 5.
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow google-api-python-client pyyaml python-dotenv"
+    # Make /opt/airflow importable so `from Collectorv2 import run` works
+    # from the DAG. Airflow only adds dags_folder and plugins_folder to
+    # sys.path by default — the project root is not on it.
+    PYTHONPATH: "/opt/airflow"
+    # Absolute path to config.yaml so Collectorv2 loads it regardless of
+    # whatever cwd the task subprocess inherits.
+    COLLECTOR_CONFIG: "/opt/airflow/config.yaml"
+  # YOUTUBE_API_KEY gets injected via .env (read by docker compose, propagated
+  # to the Airflow containers so the collect task can hit the YouTube API).
+  env_file:
+    - .env
   volumes:
     # DAG code lives on the host — edits are picked up without rebuilding.
     - ./dags:/opt/airflow/dags
-    # Airflow's own logs (task logs, scheduler heartbeats). Bind-mounted
-    # so you can tail them from the host: `tail -f logs/airflow/...`.
-    - ./logs/airflow:/opt/airflow/logs
+    # Single shared logs folder. Airflow's own task/scheduler logs land
+    # under subfolders like ./logs/dag_id=.../; the collector's event +
+    # quota JSONL files live at ./logs/YYYY-MM-DD.jsonl and
+    # ./logs/quota/YYYY-MM-DD.jsonl. Mapping them to the same host folder
+    # means the quota ledger is unified — `make run` and DAG-triggered
+    # runs share one source of truth for today's usage.
+    - ./logs:/opt/airflow/logs
     # Shared bronze layer: the collector writes here, the DAG (and later
     # dbt) reads from here. Same path as the collector service sees.
     - ./data:/opt/airflow/data
+    # The collector is imported by the DAG's collect task. /opt/airflow is
+    # on Airflow's default PYTHONPATH, so `from Collectorv2 import run`
+    # resolves natively without any sys.path hackery.
+    - ./Collectorv2.py:/opt/airflow/Collectorv2.py:ro
     # Config + channel list, read-only.
     - ./config.yaml:/opt/airflow/config.yaml:ro
     - ./competitors.csv:/opt/airflow/competitors.csv:ro
