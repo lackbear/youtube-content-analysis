@@ -1,0 +1,5 @@
+# Dashboard deps (kept separate from collector + dbt requirements).
+# Streamlit pulls in pandas and altair transitively, so no need to pin
+# them explicitly here.
+streamlit>=1.30,<2.0
+duckdb>=1.0
