@@ -24,7 +24,7 @@ venv\Scripts\activate
 source venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -r ingestion/requirements.txt
 ```
 
 ### 1.2 API key
@@ -39,7 +39,7 @@ cp .env.example .env
 ### 1.3 Verify
 
 ```bash
-python API_test.py
+python scripts/API_test.py
 # Should print 5 video titles for "data analytics for beginners"
 ```
 
@@ -77,7 +77,7 @@ attributes:
 ### 3.1 Basic — uses every default from `config.yaml`
 
 ```bash
-python Collectorv2.py
+python ingestion/Collectorv2.py
 ```
 
 ### 3.2 CLI arguments
@@ -99,19 +99,19 @@ python Collectorv2.py
 
 ```bash
 # Tiny safe run — one channel, three videos (~4 API units)
-python Collectorv2.py --channels SiimLand --max-videos 3
+python ingestion/Collectorv2.py --channels SiimLand --max-videos 3
 
 # Output as CSV instead of Parquet (eyeballable in Excel)
-python Collectorv2.py --format csv
+python ingestion/Collectorv2.py --format csv
 
 # Subset of channels
-python Collectorv2.py --channels SiimLand Physionic DrBradStanfield
+python ingestion/Collectorv2.py --channels SiimLand Physionic DrBradStanfield
 
 # Maximum allowed videos per channel
-python Collectorv2.py --max-videos 50
+python ingestion/Collectorv2.py --max-videos 50
 
 # Use an alternate config file (e.g. for a different niche)
-COLLECTOR_CONFIG=config_finance.yaml python Collectorv2.py
+COLLECTOR_CONFIG=config_finance.yaml python ingestion/Collectorv2.py
 ```
 
 ---

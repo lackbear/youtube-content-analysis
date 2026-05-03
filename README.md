@@ -52,7 +52,7 @@ ls data/raw/video_stats/date=*/channel_id=*/
 
 ## Roadmap
 
-> **Composable by design.** Each chapter is a self-contained block over an idempotent contract with the chapter below it. You can stop anywhere and still have a working system — just `python Collectorv2.py` produces bronze parquet on disk; chapter 4 schedules that same script; chapter 5 reads the same parquet through dbt; phase 2 swaps DuckDB for Databricks without touching the models. **Run any subset, replay any block — every layer is idempotent over its inputs.**
+> **Composable by design.** Each chapter is a self-contained block over an idempotent contract with the chapter below it. You can stop anywhere and still have a working system — just `python ingestion/Collectorv2.py` produces bronze parquet on disk; chapter 4 schedules that same script; chapter 5 reads the same parquet through dbt; phase 2 swaps DuckDB for Databricks without touching the models. **Run any subset, replay any block — every layer is idempotent over its inputs.**
 
 | # | Chapter | Status |
 |---|---|---|
@@ -71,15 +71,30 @@ ls data/raw/video_stats/date=*/channel_id=*/
 
 ## Repo layout
 
+Each block lives in its own folder with its own `requirements.txt` so it can be installed and run independently.
+
 ```
-├── Collectorv2.py       # active collector (chapter 2, v2.1 in chapter 4)
-├── config.yaml          # all behaviour-driving knobs
+├── ingestion/           # Block 1 — collector code
+│   ├── Collectorv2.py   # active collector (chapter 2, v2.1 in chapter 4)
+│   ├── Collector.py     # chapter 1 — kept for the diff narrative
+│   └── requirements.txt
+├── dags/                # Block 2 — Airflow DAGs (chapter 4)
+│   └── airflow_dag_v1.py
+├── dbt_youtube/         # Block 3 — dbt project (chapter 5)
+│   ├── dbt_project.yml
+│   ├── profiles.yml
+│   ├── models/
+│   └── requirements.txt
+├── dashboard/           # Block 4 — Streamlit live-state barometer
+│   ├── app.py
+│   └── requirements.txt
+├── scripts/             # one-off utilities (API_test.py, get_channel_id.py)
+├── config.yaml          # behaviour knobs (refresh_days, quota, …)
+├── competitors.csv      # channel registry (chapter 6 will expand this)
 ├── Dockerfile           # multi-stage, non-root, slim-bookworm
 ├── docker-compose.yml   # collector + Postgres + Airflow scheduler/webserver
 ├── Makefile             # docker compose shortcuts (optional)
-├── dags/                # Airflow DAGs (chapter 4)
-│   └── airflow_dag_v1.py
-├── data/                # bronze Parquet (gitignored)
+├── data/                # bronze Parquet + DuckDB warehouse (gitignored)
 ├── logs/                # event + quota JSONL + Airflow task logs (gitignored)
 └── docs/
     └── ARCHITECTURE.md  # ~900-line deep dive — start here for the why

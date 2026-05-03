@@ -35,8 +35,8 @@ x-airflow-common: &airflow-common
     # (FROM apache/airflow:... + RUN pip install ...). Documented as a
     # follow-up in chapter 5.
     _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow google-api-python-client pyyaml python-dotenv"
-    # Make /opt/airflow importable so `from Collectorv2 import run` works
-    # from the DAG. Airflow only adds dags_folder and plugins_folder to
+    # Make /opt/airflow importable so `from ingestion.Collectorv2 import run`
+    # works from the DAG. Airflow only adds dags_folder and plugins_folder to
     # sys.path by default — the project root is not on it.
     PYTHONPATH: "/opt/airflow"
     # Absolute path to config.yaml so Collectorv2 loads it regardless of
@@ -59,10 +59,11 @@ x-airflow-common: &airflow-common
     # Shared bronze layer: the collector writes here, the DAG (and later
     # dbt) reads from here. Same path as the collector service sees.
     - ./data:/opt/airflow/data
-    # The collector is imported by the DAG's collect task. /opt/airflow is
-    # on Airflow's default PYTHONPATH, so `from Collectorv2 import run`
-    # resolves natively without any sys.path hackery.
-    - ./Collectorv2.py:/opt/airflow/Collectorv2.py:ro
+    # The collector is imported by the DAG's collect task as the package
+    # `ingestion.Collectorv2`. Mounting the whole folder (including
+    # __init__.py) makes the package discoverable; PYTHONPATH=/opt/airflow
+    # then makes `from ingestion.Collectorv2 import run` resolve natively.
+    - ./ingestion:/opt/airflow/ingestion:ro
     # Config + channel list, read-only.
     - ./config.yaml:/opt/airflow/config.yaml:ro
     - ./competitors.csv:/opt/airflow/competitors.csv:ro

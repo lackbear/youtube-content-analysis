@@ -37,13 +37,14 @@ __pycache__/
 data/
 logs/
 
-# ── Legacy / chapter-1 artefacts ─────────────────────────────────────────────
-# Collector.py is kept in the repo for narrative, but the container only
-# needs Collectorv2.py. Same for the flat CSV from chapter 1.
-Collector.py
+# ── Legacy / scripts not needed at runtime ──────────────────────────────────
+# Collector.py is kept in the repo for narrative; the container only needs
+# Collectorv2.py. The scripts/ folder holds one-off utilities (API_test.py,
+# get_channel_id.py) that don't belong in the runtime image.
+ingestion/Collector.py
+ingestion/__init__.py
+scripts/
 video_stats.csv
-API_test.py
-get_channel_id.py
 
 # ── Docs / dev files ─────────────────────────────────────────────────────────
 docs/

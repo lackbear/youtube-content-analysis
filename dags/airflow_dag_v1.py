@@ -49,7 +49,7 @@ def run_collector(**context):
     sees the issue, but we don't want 2 automatic retries that would just
     abort the same way.
     """
-    from Collectorv2 import run as collector_run, QuotaExhaustedError
+    from ingestion.Collectorv2 import run as collector_run, QuotaExhaustedError
 
     try:
         collector_run()

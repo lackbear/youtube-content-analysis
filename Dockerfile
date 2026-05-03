@@ -58,7 +58,7 @@ RUN pip install --no-cache-dir --upgrade pip==24.2 setuptools wheel
 # Copy ONLY requirements.txt first. If it doesn't change between builds,
 # Docker reuses the cached layer below and skips the pip install entirely.
 # This is the single highest-impact caching trick in Python Dockerfiles.
-COPY requirements.txt .
+COPY ingestion/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 
@@ -105,7 +105,9 @@ WORKDIR /app
 # Copy the source. We only bring in what the collector actually needs at
 # runtime — NOT the old Collector.py, NOT the venv, NOT the data folder
 # (mounted at runtime), NOT the docs. .dockerignore enforces this.
-COPY --chown=collector:collector Collectorv2.py ./
+# Collectorv2.py is flattened to /app/Collectorv2.py inside the container —
+# no need for the ingestion/ package layout once we're past build time.
+COPY --chown=collector:collector ingestion/Collectorv2.py ./
 COPY --chown=collector:collector config.yaml ./
 COPY --chown=collector:collector competitors.csv ./
 

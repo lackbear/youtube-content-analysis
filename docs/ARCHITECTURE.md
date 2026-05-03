@@ -179,31 +179,49 @@ assuming `YOUTUBE_API_KEY`.
 
 ### 4.1 File layout
 
+*(Layout below reflects the chapter-5.5 reorganisation into composable-block
+folders. Pre-reorg, `Collector.py` / `Collectorv2.py` / `requirements.txt` /
+`API_test.py` / `get_channel_id.py` lived at the project root; they were
+moved into block folders to make each block self-contained — own code, own
+deps, runnable independently.)*
+
 ```
 Youtube_content_analysis/
-├── Collector.py              # Chapter 1 — kept for the story
-├── Collectorv2.py            # Chapter 2 — active
+├── ingestion/                # Block 1
+│   ├── __init__.py
+│   ├── Collector.py          # Chapter 1 — kept for the story
+│   ├── Collectorv2.py        # Chapter 2 — active
+│   └── requirements.txt      # pandas, pyarrow, google-api-python-client, …
+├── scripts/                  # one-off utilities
+│   ├── API_test.py           # Sanity ping for the API key
+│   └── get_channel_id.py     # One-off resolver for new handles
+├── dags/                     # Block 2 — Airflow DAGs (chapter 4)
+│   └── airflow_dag_v1.py
+├── dbt_youtube/              # Block 3 — dbt project (chapter 5)
+│   ├── dbt_project.yml
+│   ├── profiles.yml
+│   ├── requirements.txt
+│   └── models/
+├── dashboard/                # Block 4 — Streamlit barometer (chapter 5.5)
+│   ├── app.py
+│   └── requirements.txt
 ├── config.yaml               # All behaviour-driving knobs
-├── competitors.csv           # 10 channels resolved (channel_id + playlist_id)
-├── requirements.txt          # pandas, pyarrow, google-api-python-client, …
-├── API_test.py               # Sanity ping for the API key
-├── get_channel_id.py         # One-off resolver for new handles
+├── competitors.csv           # Channel registry (chapter 6 will expand this)
 ├── .env                      # YOUTUBE_API_KEY (gitignored)
-├── data/
-│   └── raw/
-│       └── video_stats/
-│           ├── date=2026-04-16/
-│           │   └── video_stats.parquet              ← legacy flat (v1)
-│           └── date=2026-04-17/
-│               ├── channel_id=UCAohrrjG…/video_stats.parquet   ← v2
-│               ├── channel_id=UCj3p_1jO…/video_stats.parquet   ← v2
-│               └── …
-├── logs/
-│   ├── 2026-04-16.jsonl                             ← event log (run_start, …)
-│   ├── 2026-04-17.jsonl
+├── data/                     # gitignored
+│   ├── raw/
+│   │   └── video_stats/
+│   │       ├── date=2026-04-16/
+│   │       │   └── video_stats.parquet              ← legacy flat (v1)
+│   │       └── date=2026-04-17/
+│   │           ├── channel_id=UCAohrrjG…/video_stats.parquet   ← v2
+│   │           └── …
+│   └── warehouse/
+│       └── dev.duckdb                               ← chapter 5 dbt output
+├── logs/                     # gitignored
+│   ├── 2026-04-17.jsonl                             ← event log
 │   └── quota/
-│       ├── 2026-04-16.jsonl                         ← one line per run
-│       └── 2026-04-17.jsonl
+│       └── 2026-04-17.jsonl                         ← one line per run
 └── docs/
     └── ARCHITECTURE.md                              ← this file
 ```
@@ -509,11 +527,12 @@ union both globs the way `load_seen_videos` does.
 ```bash
 cd Youtube_content_analysis
 source venv/bin/activate       # or the Windows equivalent
-python Collectorv2.py                                    # uses config defaults
-python Collectorv2.py --format csv                       # flip output format
-python Collectorv2.py --channels SiimLand Physionic      # subset of channels
-python Collectorv2.py --max-videos 5                     # subset of videos
-COLLECTOR_CONFIG=config_other.yaml python Collectorv2.py # alternate config file
+pip install -r ingestion/requirements.txt
+python ingestion/Collectorv2.py                                    # uses config defaults
+python ingestion/Collectorv2.py --format csv                       # flip output format
+python ingestion/Collectorv2.py --channels SiimLand Physionic      # subset of channels
+python ingestion/Collectorv2.py --max-videos 5                     # subset of videos
+COLLECTOR_CONFIG=config_other.yaml python ingestion/Collectorv2.py # alternate config file
 ```
 
 **Check today's quota usage**
@@ -864,13 +883,17 @@ the ledger says what.
 
 ### 11.6 The collector-importable-from-Airflow dance
 
-Three small things in `docker-compose.yml` make `from Collectorv2 import run`
-resolve from inside the Airflow scheduler container:
+Three small things in `docker-compose.yml` make
+`from ingestion.Collectorv2 import run` resolve from inside the Airflow
+scheduler container:
 
 - `PYTHONPATH=/opt/airflow` — Airflow only adds `dags_folder` and
   `plugins_folder` to `sys.path` by default; the project root is not on it.
-- A read-only bind-mount of `Collectorv2.py:/opt/airflow/Collectorv2.py:ro`
-  — so the scheduler sees the same file the host edits.
+- A read-only bind-mount of `./ingestion:/opt/airflow/ingestion:ro` —
+  so the scheduler sees the same package the host edits. (Pre-chapter-5.5
+  this was a single-file mount of `Collectorv2.py`; the chapter 5.5 reorg
+  moved the collector into an `ingestion/` package, so the mount widened
+  to the folder.)
 - `COLLECTOR_CONFIG=/opt/airflow/config.yaml` — absolute path, so the
   collector loads the config regardless of whatever cwd the task subprocess
   inherits.

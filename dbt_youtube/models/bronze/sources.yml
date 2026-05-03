@@ -12,7 +12,7 @@ sources:
   - name: bronze
     description: |
       Raw collector output (Hive-partitioned by date + channel_id).
-      Written by Collectorv2.py one parquet file per (date, channel) pair.
+      Written by ingestion/Collectorv2.py one parquet file per (date, channel) pair.
       All stat columns (views, likes, comments) are still strings here —
       casting to integers happens in silver.
     tables:
