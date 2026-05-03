@@ -89,11 +89,59 @@ def load_config(path=CONFIG_FILE):
 # Load once at import time
 _cfg             = load_config()
 REFRESH_DAYS     = _cfg["collection"]["refresh_days"]
+# Chapter 6 commit 1: re-fetch any cached video whose snapshot is older than
+# this many days, regardless of publish age. Default 1 (daily refresh).
+CACHE_MAX_AGE_DAYS = int(_cfg["collection"].get("cache_max_age_days", 1))
 MAX_RETRIES      = _cfg["api"]["max_retries"]
 BATCH_SIZE       = _cfg["api"]["batch_size"]
 VIDEO_STATS_FILE = _cfg["output"]["video_stats_file"]
-DEFAULT_CHANNELS = [ch["handle"] for ch in _cfg["channels"]]
 DEFAULT_ATTRS    = _cfg["attributes"]
+
+
+# ── Channel registry — competitors.csv (chapter 6 commit 1) ───────────────────
+# As of chapter 6, the channel list lives in competitors.csv at the project
+# root. The yaml `channels:` block is kept as an empty fallback so the
+# collector still works in environments without the CSV. The CSV is the
+# source of truth: schema + active flag + niche/tier metadata, all in one
+# place that's easy to edit by hand or programmatically.
+COMPETITORS_CSV = os.environ.get("COMPETITORS_CSV", "competitors.csv")
+
+
+def _load_channels_from_csv(csv_path: str) -> list:
+    """
+    Read competitors.csv → list of identifiers (channel_id when known, else
+    handle) for rows with active=true.
+
+    Returns [] if the file is missing, empty, or has no active rows. The
+    caller falls back to the yaml `channels:` block in that case.
+    """
+    if not os.path.exists(csv_path):
+        return []
+    try:
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        return []
+
+    if df.empty or "active" not in df.columns:
+        return []
+
+    df = df[df["active"].str.strip().str.lower() == "true"]
+    if df.empty:
+        return []
+
+    # Prefer pre-resolved channel_id (saves the forHandle lookup downstream);
+    # fall back to handle when channel_id is empty (e.g. unresolved channels).
+    out = []
+    for _, row in df.iterrows():
+        ident = row.get("channel_id", "").strip() or row.get("handle", "").strip()
+        if ident:
+            out.append(ident)
+    return out
+
+
+_csv_channels    = _load_channels_from_csv(COMPETITORS_CSV)
+_yaml_channels   = [ch["handle"] for ch in _cfg.get("channels", [])]
+DEFAULT_CHANNELS = _csv_channels or _yaml_channels
 
 # ── V2: Quota configuration ──────────────────────────────────────────────────
 # YouTube Data API v3 gives 10 000 units/day by default.
@@ -427,16 +475,36 @@ def load_seen_videos():
 
 def should_fetch(video_id, published_at_str, seen, today):
     """
-    Cache decision:
-    - Unknown              → fetch
-    - Already fetched today → skip
-    - Under REFRESH_DAYS   → re-fetch (velocity tracking)
-    - Older                → skip
+    Cache decision (chapter 6 commit 1 — adds cache-age clause):
+
+    - Unknown                              → fetch
+    - Cached today                         → skip
+    - Cached, cache-age > CACHE_MAX_AGE    → fetch (covers stable old videos
+                                              that used to freeze in cache —
+                                              channels with infrequent posts
+                                              never had their stats refreshed
+                                              once their videos aged past
+                                              REFRESH_DAYS from publish_at)
+    - Cached, publish-age <= REFRESH_DAYS  → fetch (velocity tracking — daily
+                                              re-checks for newly-published
+                                              videos that gain views fast)
+    - Else                                 → skip
+
+    Quota cost analysis: re-fetching all 110 videos (11 channels × 10) is
+    `ceil(110/50) = 3 units` for the videos.list batch — negligible at any
+    config size we care about. The skip-old-videos rule was tuned for a
+    1000+ channel pipeline; at our scale it was pure overhead.
     """
     if video_id not in seen:
         return True
-    if seen[video_id] >= today:
+    last_fetched = seen[video_id]
+    if last_fetched >= today:
         return False
+
+    cache_age_days = (today - last_fetched).days
+    if cache_age_days > CACHE_MAX_AGE_DAYS:
+        return True
+
     try:
         published = datetime.fromisoformat(
             published_at_str.replace("Z", "+00:00")

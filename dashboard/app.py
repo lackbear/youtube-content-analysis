@@ -139,6 +139,77 @@ else:
     )
 
 
+# ── Channels — dim_channel ───────────────────────────────────────────────────
+
+st.header("Channels · dim_channel")
+
+if has_table("main_silver", "dim_channel"):
+    summary = q(
+        """
+        SELECT
+            count(*)                            AS total,
+            count(*) FILTER (WHERE active)      AS active_count,
+            count(*) FILTER (WHERE NOT active)  AS inactive_count
+        FROM main_silver.dim_channel
+        """
+    ).iloc[0]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total tracked", int(summary["total"]))
+    c2.metric("Active",        int(summary["active_count"]))
+    c3.metric("Inactive",      int(summary["inactive_count"]))
+
+    col_a, col_b = st.columns(2)
+
+    by_tier = q(
+        """
+        SELECT
+            coalesce(nullif(tier, ''), '(unset)') AS tier,
+            count(*)                              AS n
+        FROM main_silver.dim_channel
+        WHERE active
+        GROUP BY tier
+        ORDER BY n DESC
+        """
+    )
+    with col_a:
+        st.markdown("**Active by tier**")
+        st.bar_chart(by_tier.set_index("tier"))
+
+    by_niche = q(
+        """
+        SELECT
+            coalesce(nullif(niche, ''), '(unset)') AS niche,
+            count(*)                                AS n
+        FROM main_silver.dim_channel
+        WHERE active
+        GROUP BY niche
+        ORDER BY n DESC
+        """
+    )
+    with col_b:
+        st.markdown("**Active by niche**")
+        st.bar_chart(by_niche.set_index("niche"))
+
+    with st.expander("Full channel registry"):
+        full = q(
+            """
+            SELECT
+                handle, name, niche, tier,
+                subscribers_at_addition, added_date,
+                active, deactivated_reason
+            FROM main_silver.dim_channel
+            ORDER BY active DESC, tier, name
+            """
+        )
+        st.dataframe(full, use_container_width=True, hide_index=True)
+else:
+    coming_soon(
+        "`dim_channel`",
+        "Chapter 6 commit 1 builds this from `competitors.csv`."
+    )
+
+
 # ── Silver — snapshot activity ───────────────────────────────────────────────
 
 st.header("Silver · snapshot activity")
@@ -301,15 +372,8 @@ st.header("What's next · empty cards light up as the project ships")
 left, right = st.columns(2)
 
 with left:
-    if has_table("main_silver", "dim_channel"):
-        st.success("**`dim_channel`** ✓ shipped — channel dimension table is live.")
-    else:
-        coming_soon(
-            "`dim_channel`",
-            "Chapter 5 commit 1.5. Sources from `competitors.csv` so dashboards "
-            "can join channel metadata (subscriber count, niche).",
-        )
-
+    # dim_channel has its own dedicated section above — no need to duplicate
+    # the coming-soon card here. Keep the slot for the next big silver model.
     if has_table("main_gold", "fct_channel_velocity"):
         st.success("**`fct_channel_velocity`** ✓ shipped.")
     else:

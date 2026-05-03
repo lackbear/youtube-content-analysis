@@ -1,22 +1,51 @@
 version: 2
 
-# Bronze sources — the collector's per-channel parquet snapshots. dbt
-# never owns these files; the collector writes them, dbt only reads.
+# Bronze sources — data the collector writes; dbt only reads.
 #
-# `meta.external_location` is a dbt-duckdb feature: the adapter rewrites
-# `{{ source('bronze', 'video_stats') }}` to the SQL expression below at
-# compile time. `hive_partitioning=true` makes DuckDB extract the
-# `date=...` and `channel_id=...` folder names as virtual columns, so we
-# don't have to join paths back in.
+# `meta.external_location` is dbt-duckdb's hook: the adapter rewrites
+# `{{ source('bronze', '...') }}` to the SQL expression below at compile
+# time.
+
 sources:
   - name: bronze
     description: |
-      Raw collector output (Hive-partitioned by date + channel_id).
-      Written by ingestion/Collectorv2.py one parquet file per (date, channel) pair.
-      All stat columns (views, likes, comments) are still strings here —
-      casting to integers happens in silver.
+      Raw collector output and the channel registry. Written by
+      ingestion/Collectorv2.py (parquet) and edited by hand or by the
+      chapter 6 curator (CSV).
     tables:
       - name: video_stats
-        description: Per-video stats snapshot. One row per video per run.
+        description: |
+          Per-video stats snapshot. One row per video per run.
+
+          Reads BOTH parquet layouts via UNION ALL BY NAME:
+            - v1 flat layout:           date=*/video_stats.parquet
+            - v2 sub-partitioned layout: date=*/channel_id=*/video_stats.parquet
+
+          The parquet body has `fetched_date` and `channel_id` already, so we
+          skip hive_partitioning (which would conflict between the two
+          layouts) and just union by column name. This surfaces channels
+          stranded in the v1 layout (Breaking Taps, The Swedish Investor,
+          CodeWithYu, Nikodem Bartnik) into silver — chapter 6 commit 1
+          closes the "stranded in v1" gap.
+
+          All stat columns (views, likes, comments) are still strings here;
+          casting to integers happens in silver.
         meta:
-          external_location: "read_parquet('../data/raw/video_stats/date=*/channel_id=*/video_stats.parquet', hive_partitioning=true, union_by_name=true)"
+          external_location: "(SELECT * FROM read_parquet('../data/raw/video_stats/date=*/video_stats.parquet', union_by_name=true) UNION ALL BY NAME SELECT * FROM read_parquet('../data/raw/video_stats/date=*/channel_id=*/video_stats.parquet', union_by_name=true))"
+
+      - name: competitors
+        description: |
+          Channel registry — source of truth for which channels to collect
+          plus the niche/tier metadata used by silver `dim_channel` and the
+          dashboard. Edited by hand or by chapter 6's curator (discover.py
+          + queue replacement, future commit).
+
+          Schema (chapter 6 commit 1):
+            handle, channel_id, name, niche, tier,
+            subscribers_at_addition, added_date, active,
+            deactivated_date, deactivated_reason
+
+          all_varchar=true keeps DuckDB from type-inferring empty cells as
+          NULL — the silver dim_channel model casts each column explicitly.
+        meta:
+          external_location: "read_csv('../competitors.csv', header=true, all_varchar=true)"

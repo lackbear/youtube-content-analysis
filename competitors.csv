@@ -1,11 +1,13 @@
-name,handle,channel_id,playlist_id,subscribers,total_views
-Siim Land,SiimLand,UCAohrrjG-3gEp5QF1WlM9_w,UUAohrrjG-3gEp5QF1WlM9_w,254000,26074379
-Physionic,Physionic,UCj3p_1jOCJXB_L_we-DjLbA,UUj3p_1jOCJXB_L_we-DjLbA,344000,41812258
-Brad Stanfield,DrBradStanfield,UCpcvPcHJVOkO9Qp79BOagTg,UUpcvPcHJVOkO9Qp79BOagTg,322000,37388170
-James Bruton,jamesbruton,UCUbDcUPed50Y_7KmfCXKohA,UUUbDcUPed50Y_7KmfCXKohA,1400000,171433850
-Breaking Taps,BreakingTaps,UC06HVrkOL33D5lLnCPjr6NQ,UU06HVrkOL33D5lLnCPjr6NQ,574000,145448742
-Ben Felix,BenFelixCSI,UCDXTQ8nWmx_EhZ2v-kp7QxA,UUDXTQ8nWmx_EhZ2v-kp7QxA,533000,31433492
-The Swedish Investor,TheSwedishInvestor,UCAeAB8ABXGoGMbXuYPmiu2A,UUAeAB8ABXGoGMbXuYPmiu2A,1010000,62058060
-Code With Yu,CodeWithYu,UCAEOtPgh29aXEt31O17Wfjg,UUAEOtPgh29aXEt31O17Wfjg,35400,1292082
-Electronoobs,Electronoobs,UCjiVhIvGmRZixSzupD0sS9Q,UUjiVhIvGmRZixSzupD0sS9Q,639000,55637178
-Nikodem Bartnik,nikodembartnik,UChrCgXmIW1toX2B7viP6S7Q,UUhrCgXmIW1toX2B7viP6S7Q,228000,23350648
+handle,channel_id,name,niche,tier,subscribers_at_addition,added_date,active,deactivated_date,deactivated_reason
+SiimLand,UCAohrrjG-3gEp5QF1WlM9_w,Siim Land,legacy,micro,254000,2026-04-16,true,,
+Physionic,UCj3p_1jOCJXB_L_we-DjLbA,Physionic,legacy,micro,344000,2026-04-16,true,,
+DrBradStanfield,UCpcvPcHJVOkO9Qp79BOagTg,Brad Stanfield,legacy,micro,322000,2026-04-16,true,,
+jamesbruton,UCUbDcUPed50Y_7KmfCXKohA,James Bruton,legacy,top,1400000,2026-04-16,true,,
+BreakingTaps,UC06HVrkOL33D5lLnCPjr6NQ,Breaking Taps,legacy,top,574000,2026-04-16,true,,
+BenFelixCSI,UCDXTQ8nWmx_EhZ2v-kp7QxA,Ben Felix,legacy,top,533000,2026-04-16,true,,
+TheSwedishInvestor,UCAeAB8ABXGoGMbXuYPmiu2A,The Swedish Investor,legacy,top,1010000,2026-04-16,true,,
+ShashankKalanithi,,Shashank Kalanithi,legacy,,,2026-04-16,false,2026-05-03,handle_no_longer_resolves
+DataVidhya,UCkgkoIdDpdimm9JpfO2aKSw,DataVidhya,legacy,micro,,2026-04-16,true,,
+CodeWithYu,UCAEOtPgh29aXEt31O17Wfjg,Code With Yu,legacy,new,35400,2026-04-16,true,,
+Electronoobs,UCjiVhIvGmRZixSzupD0sS9Q,Electronoobs,legacy,top,639000,2026-04-16,true,,
+nikodembartnik,UChrCgXmIW1toX2B7viP6S7Q,Nikodem Bartnik,legacy,micro,228000,2026-04-16,true,,
