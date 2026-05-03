@@ -80,22 +80,35 @@ attributes:
 python ingestion/Collectorv2.py
 ```
 
-### 3.2 CLI arguments
+### 3.2 Channel source — `competitors.csv` (chapter 6)
+
+As of chapter 6 the channel list lives in `competitors.csv` at the project root, NOT in `config.yaml`. The collector reads `active=true` rows on import and prefers the pre-resolved `channel_id` over `handle` (saves a `forHandle` lookup per run).
+
+```csv
+handle,channel_id,name,niche,tier,subscribers_at_addition,added_date,active,deactivated_date,deactivated_reason
+SiimLand,UCAohrrjG-3gEp5QF1WlM9_w,Siim Land,legacy,micro,254000,2026-04-16,true,,
+ShashankKalanithi,,Shashank Kalanithi,legacy,,,2026-04-16,false,2026-05-03,handle_no_longer_resolves
+```
+
+Inactive channels stay in the CSV (soft-delete) so historical bronze rows still resolve a name when joined. The yaml `channels:` block is kept as an empty fallback for environments without the CSV — when both exist, the CSV wins.
+
+### 3.3 CLI arguments
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--format {parquet,csv}` | from config (`parquet`) | Output format |
-| `--channels HANDLE [HANDLE ...]` | from config (all ~12) | Subset of channels to collect |
+| `--channels HANDLE [HANDLE ...]` | active rows of `competitors.csv` | Subset of channels — overrides the CSV for ad-hoc runs |
 | `--max-videos INT` | from config (`10`) | Videos per channel (1–50) |
 
-**Environment variable:**
+**Environment variables:**
 
 | Variable | Purpose |
 |---|---|
 | `COLLECTOR_CONFIG` | Path to an alternate config file (default: `config.yaml`) |
+| `COMPETITORS_CSV` | Path to an alternate channel registry (default: `competitors.csv`) |
 | `YOUTUBE_API_KEY` | Your API key (read via `python-dotenv` from `.env`) |
 
-### 3.3 Common recipes
+### 3.4 Common recipes
 
 ```bash
 # Tiny safe run — one channel, three videos (~4 API units)

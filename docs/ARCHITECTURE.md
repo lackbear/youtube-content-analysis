@@ -1,6 +1,6 @@
 # YouTube Data Pipeline — Architecture & Handoff Notes
 
-*Last updated: 2026-05-03 — end of Chapter 4 (Orchestration)*
+*Last updated: 2026-05-03 — end of Chapter 6 (Dynamic competitor management)*
 
 This document has two audiences. The first is **future-you starting a new chat**:
 it is a context pack so the next session can pick up exactly where this one
@@ -1056,7 +1056,740 @@ now.
 
 ---
 
-*End of Chapter 4 notes. Chapter 5 replaces the `dbt_silver` and
-`dbt_gold` placeholder tasks with real `BashOperator` invocations of
-`dbt run`, against a `dbt-duckdb` project that reads the bronze parquet
-directly. §5.4 of this doc has the project layout to aim for.*
+*End of Chapter 4 notes — chapter 5 builds on this DAG to invoke real dbt.*
+
+---
+
+## 12. Chapter 5 — transformation with dbt + DuckDB
+
+Chapter 4 made the collector scheduled. Chapter 5 makes its output
+**queryable**. The collector writes parquet; chapter 5 turns parquet
+into typed silver tables and one-row-per-question gold tables, all via
+**dbt-core + dbt-duckdb**. The same dbt project will run unchanged
+against Databricks in phase 2 — that's the architectural promise of
+this chapter, made tangible with a one-line adapter swap.
+
+Five things landed across the chapter:
+
+- `dbt_youtube/` — project, `profiles.yml`, sources, models
+- `data/warehouse/dev.duckdb` — local DuckDB warehouse (gitignored under `data/`)
+- DAG split: `dags/python_operator/youtube_pipeline.py` and
+  `dags/bash_operator/youtube_pipeline.py` — same shape, two dbt
+  invocation styles
+- A whole-project reorganisation into composable-block folders
+  (`ingestion/`, `dags/`, `dbt_youtube/`, `dashboard/`, `scripts/`)
+- `Collectorv2.py` v2.1 quota refactor — actually that landed in
+  chapter 4, but is the prerequisite for safe scheduled runs
+
+### 12.1 Why dbt at all (over hand-rolled SQL or pandas)
+
+Three real reasons, in order of weight:
+
+1. **Lineage as code.** dbt's `source()` and `ref()` macros build a
+   graph the framework knows about. `dbt run` resolves the dependency
+   order automatically. `dbt docs` renders the graph as a static site
+   (now live at <http://localhost:8081>). Hand-rolled SQL scripts have
+   the same dependencies in the engineer's head; dbt makes them
+   inspectable.
+2. **Adapter-portable models.** The same `select * from
+   {{ source('bronze', 'video_stats') }}` runs against DuckDB today
+   and against Databricks tomorrow with one config change in
+   `profiles.yml`. No model rewrite. That's the entire phase-2 plan
+   in a sentence.
+3. **Materialisation as a dial.** `+materialized: table` builds a real
+   table; `view` is a virtual layer; `incremental` is a merge. Switching
+   is a config edit, not a refactor. dbt encodes the production
+   patterns that hand-rolled SQL scripts grow into eventually.
+
+### 12.2 Why dbt-duckdb specifically
+
+The original §5.4 sketch said dbt + DuckDB; chapter 5 confirms the
+choice. DuckDB reads parquet **natively** — no ETL load step between
+"collector wrote a parquet" and "dbt sees a source." The
+`read_parquet('data/raw/video_stats/date=*/channel_id=*/video_stats.parquet')`
+call in the source declaration IS the source. No COPY, no INSERT, no
+intermediate table.
+
+Plus DuckDB is **in-process**: dbt opens a connection, runs the SQL,
+closes. No DuckDB server to manage, no port to allocate, no separate
+container to keep alive. The whole warehouse is one file at
+`data/warehouse/dev.duckdb`. You can `cp` it, version-control it
+(don't), open it in DBeaver, query it from a Jupyter notebook. The
+operational overhead is zero.
+
+The downside — single-writer concurrency — doesn't bite at this
+scale. dbt is the only writer; the dashboard reads read-only.
+
+### 12.3 The bronze→silver handshake
+
+The collector writes per-channel parquet files. dbt reads them via the
+`meta.external_location` field on the source — a dbt-duckdb feature
+where the YAML field becomes a SQL FROM expression at compile time.
+The chapter 6 follow-up grew this expression to UNION the legacy v1
+flat layout with the v2 sub-partitioned one (see §14.3 below); chapter
+5's initial form was just the v2 glob:
+
+```yaml
+# dbt_youtube/models/bronze/sources.yml — chapter 5 version
+sources:
+  - name: bronze
+    tables:
+      - name: video_stats
+        meta:
+          external_location: "read_parquet('../data/raw/video_stats/date=*/channel_id=*/video_stats.parquet', hive_partitioning=true, union_by_name=true)"
+```
+
+`hive_partitioning=true` tells DuckDB to extract the `date=YYYY-MM-DD`
+and `channel_id=UCxxxx` directory names as virtual columns, which is
+how the engine pushes WHERE-clause predicates down to file selection
+(partition pruning). `union_by_name=true` is the schema-drift
+insurance: if a future collector run adds a column, old files don't
+break the read.
+
+### 12.4 Silver: typed staging
+
+`stg_video_stats.sql` does three things and nothing else:
+
+1. **Cast types.** Bronze stores `views`/`likes`/`comments` as VARCHAR
+   (the YouTube API returns them as strings). Silver casts to BIGINT.
+2. **Drop missing.** Bronze marks unfetchable videos (deleted, private,
+   region-locked) with `status = 'missing'`. Silver filters to
+   `status = 'clean'` — the analytical layers downstream don't need
+   the missing rows.
+3. **Project narrow.** Bronze has `tags` (pipe-delimited) and
+   `description` (truncated 500 chars). Silver drops both — they're
+   text-heavy and not needed for the growth analytics this project
+   targets. Easy to add back later if the use case changes.
+
+Grain: one row per `(video_id, ingestion_timestamp)`. The snapshot
+history is preserved (NOT deduped to "latest only") so gold can
+compute deltas across snapshots.
+
+### 12.5 Bug story — `status = 'ok'` vs `'clean'`
+
+The first version of `stg_video_stats.sql` filtered `WHERE status =
+'ok'`. dbt compiled it without complaint. `dbt run` reported
+`OK created sql table model main_silver.stg_video_stats [OK in 0.18s]`.
+The downstream gold model also "succeeded." Everything was green.
+
+Silver row count: **0**.
+
+The collector emits `status = 'clean'` for successful fetches and
+`'missing'` for unfetchable ones (`Collectorv2.py:702`). The 'ok'
+filter dropped every single row. dbt compiled the empty result as a
+zero-row table — formally correct, semantically broken.
+
+The fix was three letters. The lesson is bigger: **bronze schemas are
+documented nowhere except in the collector that produces them.** Always
+inspect the source data with a one-line query before writing the
+transform. `SELECT DISTINCT status, count(*) FROM read_parquet(...)`
+would have caught it in five seconds.
+
+### 12.6 Gold: `fct_video_growth_7d` via ASOF JOIN
+
+The first gold model: per-video views/likes/comments added in a rolling
+7-day window. Grain: one row per `(video_id, snapshot_date)`.
+
+The naïve implementation is `LAG(7) OVER (PARTITION BY video_id ORDER
+BY fetched_date)`. The problem: our snapshots aren't daily — there are
+gaps. `LAG(7)` means "7 snapshots ago," which can be 7 days or 14 days
+depending on collection cadence.
+
+The right implementation is **ASOF JOIN** — for each snapshot, find
+the most-recent prior snapshot of the same video at-or-before
+`(snapshot_date - 7 days)`:
+
+```sql
+SELECT s.*, p.views as views_baseline,
+       s.fetched_date - p.fetched_date as days_since_baseline
+FROM snapshots s
+ASOF LEFT JOIN snapshots p
+    ON s.video_id = p.video_id
+    AND p.fetched_date <= s.fetched_date - INTERVAL '7' DAY
+WHERE p.fetched_date IS NOT NULL
+```
+
+`days_since_baseline` records the actual lag, so consumers know how
+loose the window was. Robust to gaps; collapses to a clean 7-day delta
+when daily snapshots are available.
+
+DuckDB has supported ASOF JOIN since 0.9. It's not standard SQL but is
+exactly the right primitive for "time-series joined to itself with a
+soft equality." Worth knowing.
+
+### 12.7 Latest-N limitation — gold only had 4 rows
+
+After the first `dbt run` against ~9 dates of bronze, gold produced 4
+rows. Investigation: high-frequency creators (Siim Land, ~1 video/day)
+churn through their "latest 10" entirely within a week. Between
+snapshots `2026-04-25` and `2026-05-03`, **zero video_ids overlap**
+in the per-channel latest-10 sets. The ASOF JOIN finds nothing to
+match against.
+
+This is an architectural finding, not a bug. The `max_videos_per_channel`
+config knob defaults to 10 — it's a quota optimisation that captures
+the most recent slice of each channel. For high-frequency creators, a
+slice of 10 doesn't span 7 days.
+
+Two clean fixes:
+
+- **Bump `max_videos_per_channel`** to 30–50 — at ~150 channels × 50
+  videos × 1 unit per 50-video batch = ~150 units/run = 1.5% of quota.
+  Affordable.
+- **Change grain to channel-level** — `fct_channel_velocity` aggregates
+  total views per channel per snapshot date, then ASOFs the channel
+  total. Gap-tolerant because the *channel* is always present even
+  when its specific videos rotate. Listed as a follow-up gold model.
+
+The dashboard's "Why gold is small" heatmap (§13.3) is the visual
+explanation of this finding.
+
+### 12.8 The DAG split — PythonOperator vs BashOperator
+
+Chapter 4 had a single DAG (`youtube_pipeline`) with placeholder dbt
+tasks. Chapter 5 commit 2 split it into two parallel DAGs in dedicated
+folders:
+
+```
+dags/
+├── python_operator/youtube_pipeline.py    # dag_id: youtube_pipeline_python
+└── bash_operator/youtube_pipeline.py      # dag_id: youtube_pipeline_bash
+```
+
+Both DAGs share the same `collect` task (PythonOperator calling
+`Collectorv2.run()` in-process — Python-shaped work) and the same
+`notify` task (PythonOperator placeholder for chapter 6). They differ
+**only** in `dbt_silver` / `dbt_gold`:
+
+| | PythonOperator (DAG A) | BashOperator (DAG B) |
+|---|---|---|
+| Invocation | `python_callable=` runs `subprocess.run(["dbt","run","--select","tag:silver"])` and raises `AirflowFailException` on non-zero exit | `bash_command="cd /opt/airflow/dbt_youtube && dbt run --select tag:silver"` |
+| Failure signal | Python exception | Non-zero exit code |
+| stdout/stderr | Captured via `subprocess.PIPE`, streamed to task log | Streams to task log natively |
+| Best for | Wrapping with pre-flight Python (quota check, freshness gate) | Pure CLI invocation, fewest layers |
+| Idiom | Common when dbt sits among other Python-mediated steps | The standard dbt-on-Airflow tutorial pattern |
+
+Both DAGs produce **identical warehouse output**. The point of shipping
+both is the side-by-side educational moment — switching variants =
+which DAG is unpaused in the Airflow UI.
+
+This retired the original "single-file-per-chapter" DAG convention
+(`airflow_dag_v1.py` → `_v2.py`) in favour of per-operator folders.
+The diff narration moves from "v1 vs v2" to "python vs bash."
+
+### 12.9 The composable-block reorganisation
+
+Mid-chapter-5, the project root had ~15 files at the top level — 4
+Python entry points (`Collector.py`, `Collectorv2.py`, `API_test.py`,
+`get_channel_id.py`) plus 3 `requirements*.txt` files plus all the
+config plus all the docker plumbing. The README's "composable layers"
+claim wasn't reflected at the directory level.
+
+The reorg moved each block into its own folder with its own
+`requirements.txt`:
+
+```
+ingestion/        Collector*.py + requirements.txt
+scripts/          API_test.py, get_channel_id.py (one-offs)
+dags/             python_operator/, bash_operator/ (chapter 5 split)
+dbt_youtube/      dbt_project.yml, models/, requirements.txt
+dashboard/        app.py, requirements.txt (chapter 5.5)
+```
+
+After the reorg the README's "each block runs independently" claim is
+literally true: `cd <block> && pip install -r requirements.txt && run`
+works for each one.
+
+DAG imports updated from `from Collectorv2 import run` to
+`from ingestion.Collectorv2 import run`. Docker bind-mounts widened
+from a single file to the folder. No data migrated; bronze/parquet
+paths are unchanged. The reorg landed as a single `chore:` commit
+with no behavioural change.
+
+### 12.10 Quick reference (Chapter 5)
+
+**Build silver + gold from existing bronze**
+
+```bash
+cd dbt_youtube
+DBT_PROFILES_DIR=. ../venv/Scripts/dbt run
+```
+
+**Inspect lineage / model SQL**
+
+```bash
+cd dbt_youtube
+DBT_PROFILES_DIR=. ../venv/Scripts/dbt docs generate
+DBT_PROFILES_DIR=. ../venv/Scripts/dbt docs serve --port 8081 --no-browser
+# open http://localhost:8081
+```
+
+**Query the warehouse from Python**
+
+```python
+import duckdb
+con = duckdb.connect('data/warehouse/dev.duckdb', read_only=True)
+print(con.sql("SELECT count(*) FROM main_silver.stg_video_stats").fetchone())
+```
+
+**Trigger the daily pipeline through Airflow**
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger youtube_pipeline_python
+# or _bash to use the BashOperator variant
+```
+
+---
+
+## 13. Chapter 5.5 — live-state Streamlit dashboard
+
+A small but important chapter. With the warehouse populated by chapter
+5, you have a queryable medallion sitting in `dev.duckdb` — but no way
+to *see* it without running ad-hoc SQL. Chapter 5.5 ships
+`dashboard/app.py`: a single-file Streamlit app that reads the warehouse
+read-only and renders pipeline state.
+
+This is **Block 4** in the composable-blocks model — agnostic to how
+the warehouse got built. `make run` filling bronze, dbt building silver,
+Airflow scheduling the lot — none of it matters to the dashboard. It
+opens the file, runs queries, renders.
+
+### 13.1 Why Streamlit (over Metabase / Superset / a notebook)
+
+A real dashboard tool would be Metabase (open-source BI) or Superset.
+Both require a running server, a separate database connection, and a
+multi-user model. None of which this project needs.
+
+Streamlit is **single-file, stdlib-shaped Python**: import streamlit
+as st, write functions, get a web UI for free. The whole app is ~280
+lines. It runs in the same venv as everything else. No service to
+manage, no separate config. For a portfolio project where the
+dashboard is itself a teaching artifact, Streamlit's "code IS the UI"
+property is right — readers can scan one file and understand the entire
+visualisation layer.
+
+The trade-off is that Streamlit isn't designed for end-users — it's a
+dev-facing live-reload tool. That's fine; the audience is "you (and
+the future-you watching the video)" not "a non-technical stakeholder."
+
+### 13.2 The `has_table()` auto-light-up pattern
+
+Every section in the dashboard is gated by a `has_table(schema, name)`
+check that queries DuckDB's `information_schema.tables`. When a model
+exists, the section renders the data; when it doesn't, the section
+renders a *coming soon* card with a one-line description of what will
+fill it.
+
+```python
+if has_table("main_silver", "dim_channel"):
+    df = q("SELECT * FROM main_silver.dim_channel")
+    # render the data
+else:
+    coming_soon("`dim_channel`", "Chapter 6 commit 1 builds this from competitors.csv.")
+```
+
+This means **the dashboard literally grows on camera**. Ship a new dbt
+model, refresh the page, the matching coming-soon card flips to live
+data. Zero dashboard code changes per new model. The roadmap is
+rendered as the UI.
+
+### 13.3 Sections rundown
+
+In rendered order from top to bottom:
+
+| Section | Source | What it answers |
+|---|---|---|
+| Pipeline freshness | `stg_video_stats` aggregates | "Is the data current?" — latest snapshot date, days since, distinct dates, channels covered |
+| Channels · `dim_channel` | `dim_channel` (chapter 6) | "Which channels are tracked?" — total/active/inactive, by-tier and by-niche bar charts, full registry expander |
+| Stale channels · curator watch | `data/curator/stale_channels.csv` (chapter 6) | "Which active channels haven't posted lately?" — active count, stale count, never-fetched count, needs-attention table |
+| Curator queue · candidates | `data/curator/candidates.csv` (chapter 6) | "What's pending review?" — pending/accepted/rejected counts, table sorted by subs DESC |
+| Silver · snapshot activity | `stg_video_stats` grouped by date | "How much was collected when?" — bar chart of rows captured per snapshot date |
+| Gold · 7-day video growth | `fct_video_growth_7d` | "Which videos grew the most?" — top-N horizontal bars by views_added, color-coded by channel |
+| Why gold is small · overlap matrix | `stg_video_stats` self-join | "Why does gold have only N rows?" — heatmap of `video_id` overlap between every pair of snapshot dates |
+| What's next | `has_table()` checks | "What's planned?" — coming-soon cards for `fct_channel_velocity`, `fct_video_leaderboard`, Airflow-driven refresh |
+
+The "Why gold is small" heatmap is the showcase visualisation. It
+turns the latest-N finding (§12.7) from words into a single image —
+diagonal cells are bright (each date overlaps fully with itself);
+off-diagonal cells far from the diagonal are dark (no overlap). The
+gold rows that exist are the bright off-diagonal cells.
+
+### 13.4 Three-port allocation
+
+The chapter introduces a port convention because three local services
+are now running simultaneously:
+
+| Service | Default port | Why |
+|---|---|---|
+| Airflow webserver | 8080 | upstream default; can't change without breaking docs |
+| dbt docs | **8081** | shifted from 8080 default to avoid Airflow collision |
+| Dashboard | 8501 | Streamlit's default; happens to be free |
+
+Documented in `dashboard/README.md` and the README's "Three local
+services" table.
+
+### 13.5 Bug fixed during build — pandas Timestamp arithmetic
+
+The first version of the freshness card had:
+
+```python
+days_old = (date.today() - max_fetched_date).days
+```
+
+…which crashed with `TypeError: unsupported operand type(s) for -:
+'datetime.date' and 'Timestamp'`. pandas had silently converted the
+`max(fetched_date)` DuckDB result to a `pd.Timestamp` instead of a
+Python `date`.
+
+The fix: compute the day delta in SQL, where DuckDB returns a clean
+integer:
+
+```sql
+SELECT (current_date - max(fetched_date)) AS days_since
+```
+
+Then `int(fresh["days_since"])` in Python. No date arithmetic in
+pandas — push it down to the warehouse where it's typed correctly.
+
+---
+
+## 14. Chapter 6 — dynamic competitor management
+
+Chapter 5 closed the data-engineering loop: collect → orchestrate →
+transform → visualise. Chapter 6 closes the **content loop** — the
+project's input (the channel list) becomes itself a managed,
+self-curating artifact. Stale channels get flagged and replaced by
+AI-sourced candidates that you review before they go live.
+
+Three commits ship the chapter:
+
+- **Commit 1** — yaml → CSV channel registry, cache-age refetch fix,
+  dim_channel model, bronze v1+v2 union
+- **Commit 2** — `detect_stale.py` + Airflow task + dashboard card
+- **Commit 3** — `discover.py` + weekly DAG + candidates queue
+
+Plus a sourcing prompt at `docs/prompts/source-200-channels.md` for
+the AI-driven channel discovery workflow.
+
+### 14.1 Why a CSV registry, not a database
+
+The project uses Postgres (chapter 4) and DuckDB (chapter 5) — could
+the channel list live in either? Yes; neither is the right answer.
+
+**Postgres** is Airflow's metadata store. Adding domain data to it
+mixes infrastructure state with business state and creates a coupling
+that bites the day someone wants to swap Airflow for Dagster.
+
+**DuckDB** is dbt's output. Putting input data there means dbt depends
+on dbt to know what to read — circular.
+
+A flat CSV at the project root is exactly the right grain. It's:
+- **Hand-editable** (Excel, notepad, vim, gh edit, …)
+- **Version-controllable** (git tracks adds/removes/edits per row)
+- **Programmatically writable** (the curator scripts append rows)
+- **Independent** (the collector reads it, dbt reads it, the
+  dashboard reads it — no service needs to be running)
+
+200 rows in a CSV is a non-problem. 200,000 would be — but we're not
+there.
+
+### 14.2 The schema with `active`
+
+```csv
+handle,channel_id,name,niche,tier,subscribers_at_addition,added_date,active,deactivated_date,deactivated_reason
+```
+
+The `active` column is the key design decision. Soft-delete instead
+of hard-delete: deactivated channels stay in the registry with
+`active=false` and a `deactivated_reason`. Two upsides:
+
+1. **Historical bronze stays joinable.** The collector wrote rows under
+   a now-deactivated channel_id; `dim_channel` still resolves the name
+   when silver/gold queries reference old data.
+2. **The curator can avoid resurrecting them.** When `discover.py`
+   finds a candidate that matches a deactivated channel_id (handle
+   spelling drift sometimes routes to the same channel), it skips the
+   suggestion — "we tried this one, it didn't work."
+
+ShashankKalanithi (one of the original 12) ships in the CSV as
+`active=false, deactivated_reason='handle_no_longer_resolves'` — the
+handle dies, the row stays as a record.
+
+### 14.3 The cache-age refetch (commit 1)
+
+A real architectural finding from earlier runs: the collector's
+`should_fetch` rule skipped re-fetching cached videos older than
+`REFRESH_DAYS` (7) from publish date. The implicit assumption was
+"stable old videos don't gain views, why re-check them." The reality
+at small config sizes: low-frequency creators (Breaking Taps, ~monthly
+posts) had their bronze frozen at first-fetch and never refreshed.
+
+Quota math says the optimisation isn't worth it at any reasonable
+scale:
+
+| Config size | `videos.list` cost / run | % of daily quota | Skip rule earns its keep? |
+|---|---|---|---|
+| 12 (original) | 3 units | 0.25% | No |
+| 200 (target) | 40 units | 4% | No |
+| 1000 | 200 units | 22% | Marginal |
+| 5000 | 1000+ units | >50% | Yes |
+
+The fix: a new `cache_max_age_days` config knob (default 1). Re-fetch
+if EITHER `today - published_at <= refresh_days` (the original velocity
+rule) OR `today - last_fetched > cache_max_age_days` (NEW). At default
+that's "refresh every cached video at least daily" — full per-day
+stat history for everything, regardless of channel posting cadence.
+
+Tunable upward when the config grows past ~1000 channels. Documented
+inline in `Collectorv2.py:should_fetch`.
+
+### 14.4 The bronze v1 + v2 union (commit 1)
+
+Pre-v2 (chapter 1), the collector wrote a flat parquet at
+`date=YYYY-MM-DD/video_stats.parquet`. v2 (chapter 2) added the
+channel sub-partition: `date=*/channel_id=*/video_stats.parquet`.
+
+Chapter 5's silver source read only the v2 layout. Chapter 6 found
+that 4 of the 12 channels (Breaking Taps, The Swedish Investor,
+CodeWithYu, Nikodem Bartnik) had bronze data only in the v1 layout
+because the cache-freeze rule (§14.3) had locked them at first-fetch.
+Silver was missing them entirely.
+
+Fix:
+
+```yaml
+meta:
+  external_location: "(SELECT * FROM read_parquet('../data/raw/video_stats/date=*/video_stats.parquet', union_by_name=true) UNION ALL BY NAME SELECT * FROM read_parquet('../data/raw/video_stats/date=*/channel_id=*/video_stats.parquet', union_by_name=true))"
+```
+
+Two `read_parquet` calls, UNION-ed. Skips `hive_partitioning` because
+the body already has `fetched_date` and `channel_id` (the path columns
+would cause a partition-mismatch error since v1 has only `date=`).
+After the change: silver row count went from 151 → **251**, distinct
+channels from 6 → **10**.
+
+Architectural pattern: **backward-compatible read, forward-compatible
+write** — readers accept both layouts; writers only produce the new.
+Same pattern the collector's `load_seen_videos` had been using since
+chapter 2. The dbt source just hadn't caught up.
+
+### 14.5 `dim_channel` (commit 1)
+
+A new silver model sourced from `bronze.competitors` (the CSV declared
+as a dbt source via `read_csv(...)`). One row per channel ever tracked,
+with `niche`, `tier`, `subscribers_at_addition`, `active`, etc. cast
+to real types.
+
+Inactive channels are NOT filtered out — they stay so historical bronze
+joins resolve. The `active` boolean is the dashboard / discover.py /
+collector's filter, not silver's.
+
+### 14.6 `detect_stale.py` (commit 2)
+
+A standalone Python script that runs an in-memory DuckDB query joining
+`competitors.csv` (active=true rows) against
+`max(published_at)` per channel from bronze parquet. Output:
+`data/curator/stale_channels.csv` with `days_since_last_post` and a
+boolean `stale` flag (true when the gap exceeds
+`curator.stale_threshold_days` from config, default 14).
+
+The script doesn't depend on dbt — it reads parquet directly. So it
+runs whether the warehouse is built or not. Composability principle:
+the curator block is independent of the transformation block.
+
+Output schema:
+```
+handle, channel_id, name, niche, tier, last_published_at,
+days_since_last_post, stale
+```
+
+Sorted by `days_since_last_post DESC NULLS FIRST` — channels that have
+NEVER been fetched (NULL `last_published_at`) sort to the top because
+they need the most attention.
+
+The Airflow integration is a **standalone parallel branch** in both
+DAGs (PythonOperator + BashOperator variants). It runs alongside the
+collect chain but never gates it — if `detect_stale` fails, `collect`
+still runs. This was the explicit "never blocks" design choice.
+
+The dashboard's "Stale channels · curator watch" card reads the CSV
+directly (not via DuckDB) — three metric cards plus a needs-attention
+table.
+
+### 14.7 The paste-list pattern for AI sourcing
+
+Original §5 plan envisioned `discover.py` calling Claude / web-search
+APIs directly to source candidates. Chapter 6 shipped a different
+shape: the AI sourcing happens in your normal Claude.ai chat (using a
+prompt at `docs/prompts/source-200-channels.md`), and `discover.py`
+only validates the resulting list.
+
+Why the pivot:
+
+- **No new API dependencies.** No Anthropic API key wired into the
+  pipeline, no separate web-search integration. The AI piece runs
+  out-of-band in a tool you already have open.
+- **Better separation of concerns.** "Creative sourcing" (LLM,
+  judgement) vs "validation" (deterministic, API-bound). The script
+  owns the deterministic half.
+- **Easier to iterate.** Bad AI batch? Throw it away, paste a new
+  one. The script is idempotent — re-runs against the same input add
+  zero new rows.
+
+The workflow:
+
+1. Open Claude.ai, paste the prompt 6 times (one per niche/tier
+   bucket — better quality than asking for all 200 at once).
+2. Concatenate the 6 CSV outputs into `data/curator/candidates_input.csv`.
+3. Run `python scripts/discover.py` (or wait for Saturday's curator DAG).
+4. Review `data/curator/candidates.csv`, mark each row `accepted` /
+   `rejected`.
+5. (Future commit 3.5) Auto-promote accepted rows into `competitors.csv`
+   to fill stale slots.
+
+### 14.8 `discover.py` validation flow
+
+For each handle in `candidates_input.csv`:
+
+1. Skip if already in `competitors.csv` OR existing `candidates.csv`
+   (case-insensitive on handle, exact on channel_id).
+2. `youtube.channels.list(forHandle=handle, part=snippet,statistics,contentDetails)`
+   → resolved channel_id, name, subscribers, uploads playlist.
+3. `youtube.playlistItems.list(playlistId=uploads, maxResults=1)` →
+   most recent video's `publishedAt`.
+4. Compute `tier` from validated subscriber count
+   (`top` ≥500k, `micro` 100k–500k, `new` <100k).
+5. If the AI-suggested tier disagrees with the validated tier, write
+   `tier_mismatch input=X validated=Y` into `notes`. Surfaces in the
+   dashboard's pending review table.
+
+API cost: 2 units per candidate. 200 candidates = 400 units = 4% of
+daily quota. Trivial.
+
+Idempotency: rerunning with the same input adds zero new rows. Status
+edits the user makes (accepted/rejected) are preserved across runs.
+
+### 14.9 First real sourcing run — what worked, what didn't
+
+Against a 158-channel input from the AI prompt:
+
+- **107 resolved** with valid handles — added to `candidates.csv` with
+  `status=pending`. Real subscriber counts visible (Lex Fridman 4.98M,
+  Andrew Huberman 7.48M, Dr Eric Berg 14.6M, …).
+- **46 not_resolved** — handles wrong, AI hallucinated names that
+  don't match real YouTube handles. Common patterns: AI suggested
+  `MattWolfe` (real handle is `mreflow`), `KenDBerry` (real is
+  `KenDBerryMD`), generic "Dr<Name>" patterns when the real channel
+  uses a different naming convention.
+- **5 dup-skipped** — already in registry from earlier test data.
+- **3 tier-mismatch flags** caught — AI guessed `micro` for Wes Roth
+  (actual: 318k = micro confirmed), `micro` for FoundMyFitness (actual:
+  672k = top), etc.
+
+The lesson: AI sourcing of YouTube handles needs the validation step
+to catch hallucinated names. Trying ~200 candidates at the script
+level cost ~316 quota units (3% of daily) — cheap insurance against
+ingesting noise into the registry.
+
+### 14.10 The weekly curator DAG
+
+`dags/curator/airflow_dag_curator.py` — a single-task DAG with
+`schedule="0 9 * * 6"` (Saturdays 09:00 UTC). Calls `discover.py`.
+Separate folder from the daily pipeline DAGs to make it visually clear
+that this is its own concern (channel lifecycle, not data flow).
+
+When you don't have a fresh `candidates_input.csv` for the week, the
+DAG is a no-op (FileNotFoundError → fail → retry once → fail
+permanently → stays red until next week). That's acceptable behaviour
+for a "informational" DAG that doesn't gate anything else.
+
+### 14.11 Bug fixed during build — Windows UTF-8 stdout
+
+Channel names regularly contain emoji (mushroom, brain, etc.). On
+Windows the default cp1252 console can't encode them, and `print(name)`
+crashed mid-loop with `UnicodeEncodeError`, losing all in-progress
+validation work for the run (`discover.py` writes the output CSV at
+the end of the loop, not per-row).
+
+Fix: reconfigure both streams to UTF-8 with `errors='replace'` at the
+top of the script:
+
+```python
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+```
+
+Unprintable characters become `?` instead of crashing. Production-
+grade scripts always need this on Windows-touching pipelines.
+
+### 14.12 Quick reference (Chapter 6)
+
+**Detect stale channels right now**
+
+```bash
+python scripts/detect_stale.py
+# Wrote data/curator/stale_channels.csv (N active channels evaluated)
+```
+
+**Source 200 candidates (manual loop)**
+
+```bash
+# 1. Open Claude.ai
+# 2. Paste docs/prompts/source-200-channels.md
+# 3. Concatenate the 6 CSV outputs into data/curator/candidates_input.csv
+python scripts/discover.py
+# Wrote data/curator/candidates.csv: M new rows
+# 4. Open data/curator/candidates.csv, mark each row 'accepted' or 'rejected'
+```
+
+**See the curator state in the dashboard**
+
+```bash
+venv/Scripts/streamlit run dashboard/app.py
+# open http://localhost:8501 — Stale and Candidates cards near the top
+```
+
+**Trigger the weekly curator DAG manually**
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger youtube_curator
+```
+
+---
+
+## 15. What's still on the table
+
+A few real follow-ups not yet shipped, in roughly increasing scope:
+
+- **Auto-promotion** — when `stale_channels.csv` flags a slot AND
+  `candidates.csv` has an `accepted` row in the matching niche, append
+  it to `competitors.csv` with `active=true` and flip the stale
+  channel's `active=false`. The queue mechanism the chapter 6 plan
+  describes; the only step still done manually. ~80 lines, single
+  Python script + one DAG task.
+- **Bump `max_videos_per_channel`** to 30+ — directly addresses the
+  latest-N limitation (§12.7). Trivial; just a config edit + a re-run
+  to backfill. Quota cost negligible.
+- **`fct_channel_velocity` gold model** — channel-grain rollup of
+  growth, gap-tolerant. Lights up another dashboard card automatically.
+- **Phase 2: Databricks adapter swap** — replace the dbt-duckdb
+  dependency with dbt-databricks, point `profiles.yml` at a
+  Databricks Community Edition cluster, push the bronze parquet to
+  DBFS. The dbt models migrate verbatim. The video moment.
+- **Custom Airflow image** — bake `dbt-core` + `dbt-duckdb` +
+  collector deps into a `FROM apache/airflow` image instead of
+  installing on every container start via `_PIP_ADDITIONAL_REQUIREMENTS`.
+  Saves ~1–2 minutes per fresh boot. Production hygiene.
+
+Each is small enough to be its own commit. None blocks the others.
+
+---
+
+*End of chapter 6 notes. The pipeline is end-to-end functional: a real
+channel registry, daily orchestrated collection, daily silver/gold dbt
+builds, a live dashboard, and a weekly curator that flags stale
+channels and validates AI-sourced replacements. The medallion is
+queryable, the lineage is rendered, the bronze isn't frozen, and the
+input list isn't a static yaml block any more — it's a managed
+artifact that knows how to grow.*
