@@ -8,7 +8,12 @@ api:
 
 # Collection behaviour
 collection:
-  max_videos_per_channel: 10        # latest videos to pull per channel
+  max_videos_per_channel: 30        # latest videos to pull per channel (chapter 6 commit 3.5:
+                                    # bumped 10 → 30 to widen the bronze window enough that
+                                    # high-frequency creators don't churn out of the latest-N
+                                    # within a 7-day ASOF JOIN window. Quota cost: ceil(30 ×
+                                    # N_channels / 50) units per run — at N=11 that's 7 units;
+                                    # negligible vs the 10000-unit daily budget.)
   refresh_days: 7                   # re-fetch videos PUBLISHED within this window (velocity tracking)
   cache_max_age_days: 1             # ALSO re-fetch any cached video whose snapshot is older than this
                                     # (chapter 6 commit 1: closes the "frozen cache for stable old videos" gap.
