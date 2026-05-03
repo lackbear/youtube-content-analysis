@@ -27,8 +27,17 @@ Run:
 
 import logging
 import os
+import sys
 from datetime import date
 from pathlib import Path
+
+# Channel names regularly contain emoji (🍄, 🧠, etc.). On Windows the
+# default cp1252 console encoding can't render them and `print()` raises
+# UnicodeEncodeError mid-loop. Forcing UTF-8 with errors='replace' means
+# unprintable chars become '?' instead of crashing the script.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 PROJECT_ROOT     = Path(__file__).resolve().parent.parent
