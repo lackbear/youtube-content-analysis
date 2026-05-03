@@ -10,9 +10,12 @@ Reads:
   - data/curator/stale_channels.csv  (stale=true rows are eligible to replace)
   - data/curator/candidates.csv      (status=accepted rows are eligible candidates)
   - competitors.csv                  (the registry to mutate)
+  - config.yaml                      (curator.max_registry_size, default 200)
 
 Writes:
-  - competitors.csv                  (1 row deactivated + 1 row appended per pair)
+  - competitors.csv                  (1 row deactivated + 1 row appended per pair;
+                                     plus FIFO-eviction of the oldest inactive row
+                                     when the file is at the size cap)
   - data/curator/candidates.csv      (status: accepted -> promoted)
 
 Niche matching:
@@ -21,9 +24,17 @@ Niche matching:
     Legacy channels have no real niche metadata; this lets the chapter 6
     sourcing replace them during the migration period.
 
-Each candidate is consumed at most once per run. If accepted candidates
-exceed stale slots in a niche, leftover candidates stay accepted and
-wait for the next stale event.
+Hard cap on registry size (curator.max_registry_size, default 200):
+  - The competitors.csv file holds at most N total rows (active + inactive).
+  - Each promotion adds 1 row (candidate appended) without removing the stale row
+    (we keep it inactive for historical join resolution). So promotions grow the
+    file by 1 per pair. When we're at the cap, a pair would push us over.
+  - To stay at-or-under N: evict the OLDEST inactive row (FIFO on
+    deactivated_date, with handle as tiebreak), then proceed with the promotion.
+  - If the cap is hit and there's no inactive row to evict (all 200 are active),
+    the pair is skipped with a warning. The candidate stays 'accepted' for next time.
+
+Each candidate is consumed at most once per run.
 
 Run:
     python scripts/promote_candidates.py            # apply changes
@@ -32,11 +43,13 @@ Run:
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 # UTF-8 stdout for Windows — channel names contain emoji.
 for stream in (sys.stdout, sys.stderr):
@@ -48,8 +61,21 @@ PROJECT_ROOT     = Path(__file__).resolve().parent.parent
 COMPETITORS_CSV  = PROJECT_ROOT / "competitors.csv"
 STALE_CSV        = PROJECT_ROOT / "data" / "curator" / "stale_channels.csv"
 CANDIDATES_CSV   = PROJECT_ROOT / "data" / "curator" / "candidates.csv"
+CONFIG_PATH      = Path(os.environ.get("COLLECTOR_CONFIG", str(PROJECT_ROOT / "config.yaml")))
 
-DEACTIVATED_REASON = "auto_replaced_by_curator"
+DEACTIVATED_REASON_PROMOTE = "auto_replaced_by_curator"
+DEACTIVATED_REASON_EVICT   = "evicted_by_registry_cap"
+DEFAULT_MAX_REGISTRY_SIZE  = 200
+
+
+def _load_max_registry_size() -> int:
+    """Read curator.max_registry_size from config; default 200."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return int(cfg.get("curator", {}).get("max_registry_size", DEFAULT_MAX_REGISTRY_SIZE))
+    except Exception:
+        return DEFAULT_MAX_REGISTRY_SIZE
 
 
 def _match_candidates(stale_df: pd.DataFrame, accepted_df: pd.DataFrame):
@@ -92,6 +118,28 @@ def _match_candidates(stale_df: pd.DataFrame, accepted_df: pd.DataFrame):
     return pairs
 
 
+def _evict_oldest_inactive(competitors: pd.DataFrame, today_str: str):
+    """
+    Find the oldest inactive row eligible for eviction (deactivated BEFORE today)
+    and return (df_without_it, victim_row). If no eligible row exists, return
+    (df_unchanged, None).
+
+    Excludes rows deactivated today — those are this run's freshly-flipped stale
+    channels, and we want to preserve their replacement record.
+    Sort key: deactivated_date ASC (oldest first), then handle ASC for tiebreak.
+    """
+    eligible = competitors[
+        (competitors["active"] == "false")
+        & (competitors["deactivated_date"] != today_str)
+        & (competitors["deactivated_date"] != "")
+    ]
+    if eligible.empty:
+        return competitors, None
+    sorted_eligible = eligible.sort_values(["deactivated_date", "handle"])
+    victim = sorted_eligible.iloc[0]
+    return competitors.drop(index=victim.name).copy(), victim
+
+
 def promote(dry_run: bool = False) -> int:
     """
     Apply (or simulate) the queue replacement. Returns number of
@@ -122,27 +170,45 @@ def promote(dry_run: bool = False) -> int:
         return 0
 
     print(f"  pairs to promote: {len(pairs)}")
+    max_size = _load_max_registry_size()
+    print(f"  registry cap: {max_size} rows; current: {len(competitors)}")
     today_str = date.today().isoformat()
     new_competitor_rows = []
-    promoted_handles   = []
+    promoted_handles    = []
+    n_skipped_cap       = 0
+    predicted_size      = len(competitors)
+    prefix              = "[DRY-RUN] " if dry_run else ""
 
     for stale_row, cand_row in pairs:
-        msg = (
-            f"  {'[DRY-RUN] ' if dry_run else ''}"
-            f"{stale_row['handle']:<25} ({stale_row['niche']}) "
-            f"-> {cand_row['handle']:<25} ({cand_row['niche']}, {cand_row['tier']}, "
-            f"{cand_row.get('subscribers', '?')} subs)"
-        )
-        print(msg)
+        # Cap check BEFORE flipping anything. Each promotion adds 1 row (the
+        # appended candidate); the stale flip is in-place and doesn't change
+        # the row count.
+        if predicted_size >= max_size:
+            new_competitors, evicted = _evict_oldest_inactive(competitors, today_str)
+            if evicted is None:
+                print(
+                    f"  {prefix}[skip-cap] cannot promote "
+                    f"{stale_row['handle']} -> {cand_row['handle']}: "
+                    f"registry at cap ({max_size}) and no evictable inactive row."
+                )
+                n_skipped_cap += 1
+                continue
+            competitors = new_competitors
+            predicted_size -= 1
+            print(
+                f"  {prefix}[evict]      {evicted['handle']:<25} "
+                f"(was inactive since {evicted['deactivated_date']}, "
+                f"reason={evicted['deactivated_reason']})"
+            )
 
-        # Mark stale row inactive in the in-memory competitors copy.
+        # Flip the stale row to inactive.
         mask = competitors["channel_id"] == stale_row["channel_id"]
         if mask.any():
             competitors.loc[mask, "active"]             = "false"
             competitors.loc[mask, "deactivated_date"]   = today_str
-            competitors.loc[mask, "deactivated_reason"] = DEACTIVATED_REASON
+            competitors.loc[mask, "deactivated_reason"] = DEACTIVATED_REASON_PROMOTE
 
-        # Append a new active row built from the candidate.
+        # Stage the new active row.
         new_competitor_rows.append({
             "handle":                  cand_row["handle"],
             "channel_id":              cand_row["channel_id"],
@@ -156,12 +222,23 @@ def promote(dry_run: bool = False) -> int:
             "deactivated_reason":      "",
         })
         promoted_handles.append(cand_row["handle"])
+        predicted_size += 1
+        print(
+            f"  {prefix}{stale_row['handle']:<25} ({stale_row['niche']}) "
+            f"-> {cand_row['handle']:<25} ({cand_row['niche']}, {cand_row['tier']}, "
+            f"{cand_row.get('subscribers', '?')} subs)"
+        )
+
+    summary = (
+        f"  {len(promoted_handles)} promoted, {n_skipped_cap} cap-skipped. "
+        f"Final registry size: {predicted_size}/{max_size}."
+    )
 
     if dry_run:
-        print(f"  [DRY-RUN] would promote {len(pairs)} pairs. No files modified.")
-        return len(pairs)
+        print(f"  [DRY-RUN] {summary} No files modified.")
+        return len(promoted_handles)
 
-    # Append new active rows to competitors and write back.
+    # Concat the new active rows and write back.
     new_df = pd.DataFrame(new_competitor_rows, columns=competitors.columns)
     competitors_out = pd.concat([competitors, new_df], ignore_index=True)
     competitors_out.to_csv(COMPETITORS_CSV, index=False)
@@ -171,8 +248,9 @@ def promote(dry_run: bool = False) -> int:
     candidates.loc[promoted_mask, "status"] = "promoted"
     candidates.to_csv(CANDIDATES_CSV, index=False)
 
-    print(f"  promoted {len(pairs)} pairs. Wrote {COMPETITORS_CSV}, {CANDIDATES_CSV}.")
-    return len(pairs)
+    print(summary)
+    print(f"  Wrote {COMPETITORS_CSV} and {CANDIDATES_CSV}.")
+    return len(promoted_handles)
 
 
 if __name__ == "__main__":

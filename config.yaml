@@ -29,6 +29,12 @@ output:
 curator:
   stale_threshold_days: 14         # flag channels with no new posts in this many days
                                     # (read by scripts/detect_stale.py)
+  max_registry_size: 200           # hard cap on competitors.csv row count (active + inactive).
+                                    # When promote_candidates.py would push the file over this,
+                                    # it evicts the oldest inactive row (FIFO on deactivated_date,
+                                    # excluding rows deactivated in this same run) to make room.
+                                    # If no eligible inactive row exists, the promotion is skipped
+                                    # for that pair.
 
 # Attributes to fetch (comment out any you don't want)
 # None here = fetch all. Remove items to narrow scope + save quota.
