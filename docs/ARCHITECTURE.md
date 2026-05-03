@@ -1,6 +1,6 @@
 # YouTube Data Pipeline — Architecture & Handoff Notes
 
-*Last updated: 2026-04-17 — end of Chapter 2 (Collectorv2)*
+*Last updated: 2026-05-03 — end of Chapter 4 (Orchestration)*
 
 This document has two audiences. The first is **future-you starting a new chat**:
 it is a context pack so the next session can pick up exactly where this one
@@ -738,3 +738,302 @@ can override CMD without overriding ENTRYPOINT. This gives you
 three-service compose file. Re-read §5.2 and §5.3 of this doc before
 starting the next session — the target shape there is now one chapter
 away.*
+
+---
+
+## 11. Chapter 4 — orchestrating with Airflow
+
+Chapter 3 made the collector portable. Chapter 4 makes it **scheduled**,
+**observable**, and **safe under failure**. The same Python script, the
+same config, the same parquet output — now triggered nightly by a
+workflow engine instead of by you typing `make run`. This is the bridge
+from "I have a working data tool" to "I have a working data **pipeline**."
+
+Three new artefacts and one substantial refactor of the collector landed:
+
+- `dags/airflow_dag_v1.py` — the first DAG, four tasks
+- `docker-compose.yml`     — Postgres + three Airflow services added; bind-mounts and env vars wire the collector in
+- `Collectorv2.py` v2.1    — quota integrity refactor (try/finally, `QuotaExhaustedError`)
+- `Makefile`               — `airflow-up`, `airflow-down`, `airflow-logs`, `airflow-ui` shortcuts
+
+### 11.1 Why PostgreSQL, not SQLite
+
+Airflow keeps its metadata — DAG run history, task instance state,
+schedule decisions, connection secrets — in a relational database. The
+default is SQLite, which works for tutorials and breaks for everything
+else. SQLite gives you no concurrent writers (the scheduler and webserver
+both want to write), and on container restart the file lives inside the
+ephemeral container filesystem. One `docker compose down` and the entire
+DAG run history evaporates.
+
+PostgreSQL solves both. Concurrent writes are its job, and the data lives
+in a named Docker volume (`postgres_data`) outside any container. Stop
+the stack, restart it next week, and your DAG runs are still in the UI.
+This is the "stateful services own their state in named volumes;
+stateless services restart freely" pattern from §10.5.
+
+Supabase and Firebase were considered and rejected. Supabase is Postgres
+plus a hosted dashboard plus auth plus storage — overkill for a
+metadata DB nobody but Airflow reads. Firebase is NoSQL; Airflow needs
+a SQL backend.
+
+### 11.2 Task scoping — Option C
+
+There are three plausible ways to slice the collector into Airflow tasks:
+
+| Option | Shape | Why it loses |
+|---|---|---|
+| A | One monolithic task that runs `Collectorv2.run()` | No retry granularity — a transient API hiccup forces a re-run of resolution, fetch, and write. Quota-wasteful. |
+| B | One task per **collector phase** (resolve → fetch → write) | XCom serialization hell. The resolve task hands a list of channel-objects to the fetch task — those don't pickle cleanly across worker boundaries. Either you serialize manually or you bind-mount a shared filesystem and pass paths, both of which add complexity for no real benefit at this scale. |
+| C | One task per **service boundary** (collect → dbt-silver → dbt-gold → notify) | Retries are scoped to the right unit. Each task is a different *type* of failure with different remediation. Picked. |
+
+Option C is what every production pipeline I've inspected actually looks
+like. Phase-per-task is a beginner trap; one-monolithic-task is a
+procrastination trap. The right grain is **per service** — the collector
+is one service, dbt is another, notification is another. Today only
+`collect` does real work; `dbt_silver`, `dbt_gold`, and `notify` are
+placeholders that will be wired up in chapters 5 and 6. Keeping them in
+the DAG now means the dependency chain is locked in and the diagram is
+visible end-to-end from day one.
+
+### 11.3 Schedule — 08:00 UTC and the PT-midnight reset
+
+Cron expression: `0 8 * * *`. Daily at 08:00 UTC. Why not `0 0 * * *`
+(UTC midnight, the obvious default)?
+
+The YouTube Data API v3 quota resets at midnight **Pacific Time**, not
+UTC. PT midnight is 07:00 or 08:00 UTC depending on daylight saving. A
+run at 00:00 UTC is mid-afternoon in California, after a full day's
+quota burn — zero quota headroom. Running at 08:00 UTC puts the run
+safely past the rollover on every DST edge case. This single line in the
+DAG is worth more than every retry-policy choice put together; the
+alternative is mysterious 403s for half the year.
+
+Two more flags pin the runtime shape: `catchup=False` (never backfill
+missed schedules — stale snapshots aren't useful) and `max_active_runs=1`
+(one concurrent run only — avoids quota double-spend if a long-running
+task overlaps with the next schedule).
+
+### 11.4 LocalExecutor — and the upgrade path
+
+Airflow has four executors that matter, in order of how much they
+orchestrate:
+
+- **SequentialExecutor** — runs one task at a time, single process. Toy-grade.
+- **LocalExecutor** — multiple processes on one host, shared metadata DB. Picked.
+- **CeleryExecutor** — workers across multiple hosts, talking via a Redis broker. Production-grade.
+- **KubernetesExecutor** — each task is its own pod. Production-grade for cloud-native shops.
+
+LocalExecutor is the right POC choice. It runs the four tasks in parallel
+on one machine (which is more than this DAG ever needs) and requires zero
+extra infrastructure — no Redis, no Celery workers, no ECS. The upgrade
+path is config-only: change `AIRFLOW__CORE__EXECUTOR` to `CeleryExecutor`,
+add a Redis service to compose, scale workers horizontally. None of the
+DAG code changes.
+
+### 11.5 The quota integrity refactor — Collectorv2 v2.1
+
+Wiring the collector under an orchestrator surfaced a class of bugs that
+didn't matter when a human invoked it manually. Three changes hardened
+the run lifecycle:
+
+**Try/finally around `record_quota_usage`.** In v2 the quota log line was
+emitted on the success path. If the collector crashed after spending
+units but before reaching the log line, those units were lost from the
+ledger — and the next run would underestimate today's usage and could
+push over quota. Wrapping the run body in `try/finally` means the ledger
+fires no matter how the run exits.
+
+**Incremental unit tracking.** v2 estimated post-hoc — "we made 12
+calls, that's 12 units." v2.1 increments `units_spent` after each API
+call. Same number on the happy path; meaningfully more accurate when the
+run partially fails (the unit-spend at the moment of crash is preserved).
+
+**`QuotaExhaustedError` instead of silent return.** v2's quota hard-stop
+returned silently. From the orchestrator's perspective, that looked like
+a successful run — green tick, nothing to alert on. v2.1 raises
+`QuotaExhaustedError`; the DAG's task wrapper converts it to
+`AirflowFailException`, and the task fails red. The DAG also pins
+`retries=0` for this specific exception type — because the quota won't
+reset within the next retry window (10 minutes), retrying just burns
+more units and fails the same way.
+
+The new `run_outcome="failed"` value rounds out the audit trail:
+`success`, `no_work`, `aborted_over_quota`, `failed`. Whatever happened,
+the ledger says what.
+
+### 11.6 The collector-importable-from-Airflow dance
+
+Three small things in `docker-compose.yml` make `from Collectorv2 import run`
+resolve from inside the Airflow scheduler container:
+
+- `PYTHONPATH=/opt/airflow` — Airflow only adds `dags_folder` and
+  `plugins_folder` to `sys.path` by default; the project root is not on it.
+- A read-only bind-mount of `Collectorv2.py:/opt/airflow/Collectorv2.py:ro`
+  — so the scheduler sees the same file the host edits.
+- `COLLECTOR_CONFIG=/opt/airflow/config.yaml` — absolute path, so the
+  collector loads the config regardless of whatever cwd the task subprocess
+  inherits.
+
+The `:ro` is intentional. The DAG should not be allowed to mutate the
+collector source from a task — that would break the principle that source
+code is what's committed, not what's runtime-mutated.
+
+One more subtlety: the import of `Collectorv2` happens *inside* the task
+callable, not at the top of the DAG file. Airflow re-parses every DAG
+file on every scheduler tick (~30s); keeping module-level code cheap
+means the scheduler stays responsive. `Collectorv2`'s import side
+effects (`load_config`, `DEFAULT_CHANNELS`) only fire when the `collect`
+task actually runs.
+
+### 11.7 `_PIP_ADDITIONAL_REQUIREMENTS` — a POC pattern with a follow-up
+
+The Airflow image doesn't ship with `pandas`, `pyarrow`,
+`google-api-python-client`, etc. Two ways to fix that:
+
+1. **Build a custom image**: `FROM apache/airflow:... + RUN pip install ...`.
+   Layered, cached, fast — the right answer for production.
+2. **`_PIP_ADDITIONAL_REQUIREMENTS`**: a magic env var the upstream
+   Airflow entrypoint reads at container startup, runs `pip install`
+   against, then proceeds. Adds 30–60s to first boot; cached afterward.
+
+For a POC, (2) is right. It keeps the docker-compose file readable and
+avoids a custom Dockerfile-per-service. The follow-up — chapter 5 or
+whenever startup time starts hurting — is to bake the dependencies into
+a custom image. That's documented in the docker-compose comment so
+future-you doesn't forget.
+
+### 11.8 Observability under failure — what the first runs revealed
+
+The day this chapter shipped, the first scheduled DAG run quietly
+demonstrated something useful. Of the 12 channels in `config.yaml`, **11**
+resolved. The one that didn't was `ShashankKalanithi` — its handle no
+longer maps to a live channel via YouTube's `forHandle` lookup.
+
+This is exactly the kind of failure the project's "demonstration
+failures" stance values: the system handled it correctly. `resolve_channel`
+got an empty result, logged a `WARNING: Could not resolve:
+'ShashankKalanithi'`, returned `None`, and the main loop carried on with
+the 11 resolved channels. The DAG turned green; the parquet output was
+complete for the 11 channels that did resolve; the quota log recorded the
+24 units spent.
+
+But the failure surfaced **only in stdout**, captured by Airflow's
+per-task log file. The structured JSONL event log
+(`logs/YYYY-MM-DD.jsonl`) — the source of truth for "what happened
+during a run" — has no entry for the failure. `channel_resolved` events
+fire on success only; there's no `channel_resolution_failed` counterpart.
+A future Airflow alert keying off the structured stream wouldn't see this.
+
+This is an observability gap, not a correctness bug. Worth a separate
+`fix:` commit that emits a `channel_resolution_failed` event on the `else`
+branch — the chapter ships without it, and the gap is named explicitly so
+the next session can close it cleanly.
+
+### 11.9 Drift from the §5.3 plan
+
+§5.3 of this doc, written before chapter 4 started, sketched a 5-task DAG:
+`preflight → collect → dbt_bronze_to_silver → dbt_silver_to_gold →
+publish_metrics`. The shipped DAG is 4 tasks: `collect → dbt_silver →
+dbt_gold → notify`. The differences:
+
+- **No standalone `preflight` task.** The collector already does its own
+  quota preflight inside `Collectorv2.run()`, with the audit trail (`event:
+  "quota_preflight"`) landing in the same JSONL stream as the rest of the
+  run. Splitting it into its own Airflow task would have meant duplicating
+  the logic, splitting the audit trail across two task contexts, and
+  passing state via XCom for no real benefit. The collector's preflight
+  is the right grain.
+- **Names shortened.** `dbt_bronze_to_silver` → `dbt_silver`. Shorter,
+  matches dbt's own selector syntax (`tag:silver`).
+- **`publish_metrics` → `notify`.** Reframed as "tell humans what
+  happened" rather than "produce another data artefact." The output of
+  the DAG is the bronze parquet; downstream content generation reads from
+  the gold tables, not from a metrics JSON.
+
+Worth recording so that the §5.3 sketch isn't read in isolation as the
+spec — the actual implementation drifted, and for good reasons.
+
+### 11.10 Quick reference (Chapter 4)
+
+**Bring the stack up**
+
+```bash
+make airflow-up
+make airflow-ui          # prints the URL + creds
+```
+
+**Sanity-check the DAG**
+
+```bash
+docker compose exec airflow-scheduler airflow dags list-import-errors
+docker compose exec airflow-scheduler airflow dags list | grep youtube_pipeline
+```
+
+**Trigger one task in isolation (placeholder tasks burn no quota)**
+
+```bash
+docker compose exec airflow-scheduler airflow tasks test youtube_pipeline dbt_silver 2026-05-03
+```
+
+**Trigger the full DAG**
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger youtube_pipeline
+```
+
+**Tail logs**
+
+```bash
+make airflow-logs        # scheduler + webserver, interleaved
+# Per-task logs live on the host:
+ls logs/dag_id=youtube_pipeline/run_id=*/task_id=collect/
+```
+
+**Stop the stack (preserves DAG history)**
+
+```bash
+make airflow-down        # `down --volumes` to wipe Postgres state too
+```
+
+### 11.11 Concepts worth internalising before Chapter 5
+
+**DAG.** A directed acyclic graph of tasks. "Directed" means edges go one
+way (collect → dbt_silver, never the reverse). "Acyclic" means no loops.
+The unit Airflow operates on; the file you write.
+
+**Operator.** The "kind of work" a task does. `PythonOperator` runs a
+Python callable; `BashOperator` runs a shell command; `DockerOperator`
+runs a container. Pick the operator that matches the work; don't shoehorn
+Bash into Python.
+
+**Task instance.** A specific (DAG, task, execution_date) tuple.
+`youtube_pipeline.collect` for `2026-05-03` is one task instance. Retries
+count per-instance; the unit Airflow stores in the metadata DB.
+
+**Execution date / logical date.** The logical timestamp the DAG run
+*represents*, not the wall-clock time it ran. A scheduled run for
+`2026-05-03T08:00` may execute at 09:14 if the scheduler was busy —
+`execution_date` stays `2026-05-03T08:00`. Use it (not `datetime.now()`)
+inside tasks to make backfills idempotent.
+
+**Catchup.** When a DAG starts (or unpauses) after missing scheduled
+runs, should Airflow run them all in order? `catchup=True` (default) yes;
+`catchup=False` no. We pin `False`: stale snapshots aren't useful, and
+the cost of catching up is API quota we don't want to spend on yesterday.
+
+**XCom.** Airflow's tiny inter-task message bus, backed by the metadata
+DB. Pass small values between tasks (a row count, a status flag). Don't
+pass large objects through it — that's what shared filesystems / object
+stores are for.
+
+**`on_failure_callback`.** A hook that fires when a task fails. Wired up
+in chapter 6 to post Slack/email alerts. Reserved in `default_args` for
+now.
+
+---
+
+*End of Chapter 4 notes. Chapter 5 replaces the `dbt_silver` and
+`dbt_gold` placeholder tasks with real `BashOperator` invocations of
+`dbt run`, against a `dbt-duckdb` project that reads the bronze parquet
+directly. §5.4 of this doc has the project layout to aim for.*

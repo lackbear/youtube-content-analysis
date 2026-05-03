@@ -6,7 +6,7 @@
 ![Docker](https://img.shields.io/badge/docker-containerized-2496ED?logo=docker&logoColor=white)
 ![Parquet](https://img.shields.io/badge/storage-Parquet-50B7E0)
 ![Status](https://img.shields.io/badge/status-active-brightgreen)
-![Chapter](https://img.shields.io/badge/chapter-3%2F6-yellow)
+![Chapter](https://img.shields.io/badge/chapter-4%2F6-yellow)
 
 ## What it does
 
@@ -52,27 +52,37 @@ ls data/raw/video_stats/date=*/channel_id=*/
 
 ## Roadmap
 
+> **Composable by design.** Each chapter is a self-contained block over an idempotent contract with the chapter below it. You can stop anywhere and still have a working system — just `python Collectorv2.py` produces bronze parquet on disk; chapter 4 schedules that same script; chapter 5 reads the same parquet through dbt; phase 2 swaps DuckDB for Databricks without touching the models. **Run any subset, replay any block — every layer is idempotent over its inputs.**
+
 | # | Chapter | Status |
 |---|---|---|
 | 1 | Collector v1 — working daily snapshot | ✅ shipped |
 | 2 | Collector v2 — quota tracking, sub-partitioning, ingestion timestamps | ✅ shipped |
 | 3 | Containerisation — Docker multi-stage + compose | ✅ shipped |
-| 4 | Orchestration — Airflow + PostgreSQL + dbt | 🚧 next |
-| 5 | Databricks + medallion (Silver / Gold) | ⏳ planned |
+| 4 | Orchestration — Airflow + PostgreSQL | ✅ shipped |
+| 5 | Transformation — dbt + DuckDB (Silver / Gold) | 🚧 next |
 | 6 | Content generation — short-form auto-publishing | ⏳ planned |
+
+**Future / swappable blocks** *(not numbered — they replace pieces above without changing the contract)*
+
+| Phase | Scope | Status |
+|---|---|---|
+| 2 | Cloud lakehouse — re-platform medallion onto Databricks Community Edition (dbt models migrate verbatim) | ⏳ stretch |
 
 ## Repo layout
 
 ```
-├── Collectorv2.py       # active collector (chapter 2)
+├── Collectorv2.py       # active collector (chapter 2, v2.1 in chapter 4)
 ├── config.yaml          # all behaviour-driving knobs
 ├── Dockerfile           # multi-stage, non-root, slim-bookworm
-├── docker-compose.yml   # one service today, three after chapter 4
+├── docker-compose.yml   # collector + Postgres + Airflow scheduler/webserver
 ├── Makefile             # docker compose shortcuts (optional)
+├── dags/                # Airflow DAGs (chapter 4)
+│   └── airflow_dag_v1.py
 ├── data/                # bronze Parquet (gitignored)
-├── logs/                # event + quota JSONL (gitignored)
+├── logs/                # event + quota JSONL + Airflow task logs (gitignored)
 └── docs/
-    └── ARCHITECTURE.md  # 700-line deep dive — start here for the why
+    └── ARCHITECTURE.md  # ~900-line deep dive — start here for the why
 ```
 
 ## Deep dive
