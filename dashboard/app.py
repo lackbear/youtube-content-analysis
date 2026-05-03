@@ -23,6 +23,7 @@ from pathlib import Path
 
 import altair as alt
 import duckdb
+import pandas as pd
 import streamlit as st
 
 
@@ -207,6 +208,44 @@ else:
     coming_soon(
         "`dim_channel`",
         "Chapter 6 commit 1 builds this from `competitors.csv`."
+    )
+
+
+# ── Stale channels · curator watch (chapter 6 commit 2) ─────────────────────
+
+st.header("Stale channels · curator watch")
+
+stale_csv = WAREHOUSE.parents[1] / "curator" / "stale_channels.csv"
+
+if stale_csv.exists():
+    stale_df = pd.read_csv(stale_csv)
+    stale_mask = stale_df["stale"].fillna(False).astype(bool)
+    unfetched_mask = stale_df["last_published_at"].isna()
+
+    n_active    = len(stale_df)
+    n_stale     = int(stale_mask.sum())
+    n_unfetched = int(unfetched_mask.sum())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active channels", n_active)
+    c2.metric("Stale (>14d)",    n_stale)
+    c3.metric("Never fetched",   n_unfetched)
+
+    needs_attention = stale_df[stale_mask | unfetched_mask].copy()
+    if len(needs_attention):
+        st.markdown("**Needs attention** — sorted by days_since_last_post (NULLS first):")
+        st.dataframe(
+            needs_attention[
+                ["handle", "name", "tier", "last_published_at", "days_since_last_post"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+else:
+    coming_soon(
+        "`stale_channels.csv`",
+        "Chapter 6 commit 2 — `scripts/detect_stale.py` will flag channels "
+        "with no new posts in N days here, driving the curator's replacement queue.",
     )
 
 

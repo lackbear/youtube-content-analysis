@@ -20,6 +20,11 @@ output:
   video_stats_file: video_stats   # filename without extension (extension added by format)
   format: parquet                  # parquet (default) or csv
 
+# Curator — chapter 6: channel lifecycle management
+curator:
+  stale_threshold_days: 14         # flag channels with no new posts in this many days
+                                    # (read by scripts/detect_stale.py)
+
 # Attributes to fetch (comment out any you don't want)
 # None here = fetch all. Remove items to narrow scope + save quota.
 attributes:

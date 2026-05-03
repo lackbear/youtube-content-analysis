@@ -67,6 +67,11 @@ x-airflow-common: &airflow-common
     # __init__.py) makes the package discoverable; PYTHONPATH=/opt/airflow
     # then makes `from ingestion.Collectorv2 import run` resolve natively.
     - ./ingestion:/opt/airflow/ingestion:ro
+    # Curator scripts (chapter 6) — detect_stale.py and (later) discover.py.
+    # Both DAGs invoke them either via `from scripts.detect_stale import ...`
+    # (PythonOperator variant) or `python /opt/airflow/scripts/detect_stale.py`
+    # (BashOperator variant).
+    - ./scripts:/opt/airflow/scripts:ro
     # dbt project — both DAGs (python_operator and bash_operator variants)
     # invoke dbt against this folder. Read-write because dbt writes
     # target/ (compiled SQL, manifest, run_results) and logs/ here on

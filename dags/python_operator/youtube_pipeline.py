@@ -64,6 +64,18 @@ def run_collector(**context):
         ) from e
 
 
+def run_detect_stale(**context):
+    """
+    Flag channels with no new posts in N days (chapter 6 commit 2).
+
+    Standalone branch — never blocks the collect chain. Reads bronze
+    parquet directly + competitors.csv; writes data/curator/stale_channels.csv.
+    """
+    from scripts.detect_stale import detect_stale
+    path = detect_stale()
+    print(f"Wrote {path}")
+
+
 def _run_dbt(select_arg: str) -> None:
     """
     Subprocess-run `dbt run --select <arg>` from /opt/airflow/dbt_youtube.
@@ -154,6 +166,13 @@ with DAG(
     notify_task = PythonOperator(
         task_id="notify",
         python_callable=notify,
+    )
+
+    # Standalone parallel branch — informs the curator (chapter 6 commit 3)
+    # without gating the collect chain. If detect_stale errors, collect still runs.
+    detect_stale_task = PythonOperator(
+        task_id="detect_stale",
+        python_callable=run_detect_stale,
     )
 
     collect >> dbt_silver >> dbt_gold >> notify_task

@@ -118,4 +118,12 @@ with DAG(
         python_callable=notify,
     )
 
+    # Standalone parallel branch — informs the curator (chapter 6 commit 3)
+    # without gating the collect chain. BashOperator-flavoured: invoke
+    # the script via the Python interpreter directly.
+    detect_stale_task = BashOperator(
+        task_id="detect_stale",
+        bash_command="python /opt/airflow/scripts/detect_stale.py",
+    )
+
     collect >> dbt_silver >> dbt_gold >> notify_task
