@@ -416,8 +416,7 @@ Paste something like this into the new conversation. It is deliberately a
 *learning* prompt, not a *do* prompt — it frames the session as Claude
 teaching, not executing blind.
 
-> I'm continuing a YouTube data pipeline project at
-> `C:\Users\moham\Documents\Claude\Projects\youtube-data-pipeline\Youtube_content_analysis`.
+> I'm continuing a YouTube data pipeline project at `<repo root>`.
 > Read `docs/ARCHITECTURE.md` first — it has the full context of what's
 > built and what the target state is. I'm ready to start Chapter 3:
 > stand up Docker + Airflow + PostgreSQL locally (Option A POC) to
