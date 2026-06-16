@@ -88,15 +88,28 @@ Streamlit reads `.streamlit/config.toml` from the current working directory
 re-skin the UI. A complementary **Altair theme** is applied programmatically
 in `lib/theme.py` so charts share the same palette + typography.
 
-## Caching
+## Caching & the in-memory mirror
 
-- `get_connection()` is `@st.cache_resource` — one DuckDB connection per
-  Streamlit session, opened read-only.
-- `q(sql, params)` is `@st.cache_data(ttl=300)` — 5 minute TTL.
-  Keyed on the SQL string + params tuple, so flipping filters reuses prior
-  results.
+DuckDB is single-writer at the file level: a read-only open still takes a
+*shared* OS lock that conflicts with dbt's exclusive write lock (on Windows it
+hard-fails with "the file is being used by another process"). A long-lived
+read-only connection from the dashboard therefore blocks the Airflow
+`tag:silver`/`tag:gold` dbt runs — the pipeline's old single point of failure.
+
+To break that, the dashboard never holds a connection to `dev.duckdb`. Instead
+`get_connection()` builds an **in-memory mirror**: it briefly `ATTACH`es the
+warehouse read-only, `COPY FROM DATABASE` into memory, then `DETACH`es —
+releasing the lock. All queries hit the in-memory copy, so dbt always has
+exclusive write access and the DAG can run while the dashboard is open.
+
+- `get_connection()` / `_mirror()` are `@st.cache_resource`, **keyed on the
+  warehouse file's mtime**. When dbt rewrites the file the mtime bumps and the
+  mirror is rebuilt from fresh data on the next interaction — no restart.
+- `q(sql, params)` is `@st.cache_data(ttl=300)` — 5 minute TTL, keyed on the
+  SQL string + params + mtime, so flipping filters reuses prior results but a
+  dbt rewrite invalidates the cache.
 - After a manual Airflow trigger you can wait the TTL or click
-  **Clear cache and reconnect** on the Pipeline Ops page.
+  **Clear cache and reconnect** on the Pipeline Ops page to re-snapshot now.
 
 ## Ports
 
