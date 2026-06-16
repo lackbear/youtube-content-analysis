@@ -29,6 +29,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Airflow 2.10 ships with only `session` auth on the REST API by default,
+    # which only authenticates browser sessions. The dashboard's Pipeline Ops
+    # page calls `/api/v1/...` over Basic auth — enabling `basic_auth` here
+    # lets it work without us having to scrape a session cookie.
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.session,airflow.api.auth.backend.basic_auth"
     # POC pattern: install runtime deps (collector + dbt) on container startup.
     # Adds ~1–2 min to first boot; subsequent starts are cached by pip.
     # Production replacement: build a custom Airflow image with these baked in

@@ -1,0 +1,27 @@
+# Streamlit theme + runtime config.
+#
+# Streamlit picks this up because it's at <cwd>/.streamlit/config.toml — and
+# the README runs the dashboard from this folder (`streamlit run dashboard/app.py`).
+# Move this file into ~/.streamlit/ if you want it to apply globally instead.
+
+[theme]
+base = "light"
+primaryColor = "#FF0033"          # YouTube-ish red — applied to selected widgets
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F6F8"
+textColor = "#1F2937"
+font = "sans serif"
+
+[server]
+# Don't auto-open the browser on `streamlit run` from headless contexts (CI,
+# Docker). Keep `false` here; users with a desktop env can add `--headless false`.
+headless = true
+runOnSave = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = true
+toolbarMode = "auto"

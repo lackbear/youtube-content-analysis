@@ -16,7 +16,7 @@
 # .PHONY tells make "these are commands, not files on disk". Without this,
 # if a file called `build` ever appeared in the folder, `make build` would
 # think there's nothing to do.
-.PHONY: help build run run-csv run-debug shell logs quota-today clean prune rebuild airflow-up airflow-down airflow-logs airflow-ui
+.PHONY: help build run run-csv run-debug shell logs quota-today clean prune rebuild airflow-up airflow-down airflow-logs airflow-ui dashboard
 
 # Default target when you just type `make`. Prints the list of commands.
 help:
@@ -38,6 +38,9 @@ help:
 	@echo "  make airflow-down  Stop Airflow stack (keeps DAG history in postgres_data)"
 	@echo "  make airflow-logs  Tail scheduler + webserver logs"
 	@echo "  make airflow-ui    Print the UI URL + admin credentials"
+	@echo ""
+	@echo "  Dashboard (chapter 5.5 / 6.5):"
+	@echo "  make dashboard     Create venv if missing, install deps, run Streamlit"
 
 # Build honours the layer cache. Fast on re-runs when requirements.txt hasn't
 # changed. `--pull` refreshes the base image so we track upstream CVE fixes.
@@ -124,3 +127,25 @@ airflow-logs:
 airflow-ui:
 	@echo "Airflow UI: http://localhost:8080"
 	@echo "Login:      admin / admin   (POC creds — rotate before exposing)"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chapter 5.5 / 6.5 — Streamlit dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One-shot first-run + every-time-after for the dashboard.
+# Creates ./venv if missing, installs/refreshes dashboard deps, then launches
+# Streamlit. Runs in the FOREGROUND — Ctrl+C stops it. The dashboard reads
+# the warehouse read-only, so it's safe to run while Airflow's dbt tasks
+# are also writing (DuckDB grants concurrent readers).
+dashboard:
+	@if [ ! -d venv ]; then \
+		echo ">> Creating venv at ./venv"; \
+		python -m venv venv; \
+	fi
+	@echo ">> Installing dashboard deps"
+	@./venv/Scripts/python -m pip install -q -r dashboard/requirements.txt 2>/dev/null \
+		|| ./venv/bin/python   -m pip install -q -r dashboard/requirements.txt
+	@echo ">> Starting Streamlit at http://localhost:8501"
+	@./venv/Scripts/streamlit run dashboard/app.py 2>/dev/null \
+		|| ./venv/bin/streamlit   run dashboard/app.py
